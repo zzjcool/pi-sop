@@ -24,7 +24,13 @@ import { Type } from "typebox";
 
 import { parseInitArgs, runInit } from "./commands/init.ts";
 import { readConfig, resolveLibDir, writeConfig, CONFIG_VERSION } from "./lib/config.ts";
-import { describeState, isUsable, probeLibrary, type ProbeResult } from "./lib/probe.ts";
+import {
+	describeState,
+	isUsable,
+	lockPathForDir,
+	probeLibrary,
+	type ProbeResult,
+} from "./lib/probe.ts";
 import { hasSkeleton, refreshManifest, scaffoldLibrary, today } from "./lib/scaffold.ts";
 import { countSops, renderManifest, renderSop, scanSopDir, slugifySopName } from "./lib/sop.ts";
 import {
@@ -33,6 +39,7 @@ import {
 	pushLibrary,
 	SYNC_THROTTLE_MS,
 	syncLibrary,
+	withLock,
 } from "./lib/sync.ts";
 
 /** Notify text (design §7, one-pass final wording). */
@@ -81,14 +88,27 @@ export default function piSop(pi: ExtensionAPI): void {
 
 		const { dir, probe } = resolveState();
 		if (probe.state === "ready") {
-			// Fire and forget: the sync has its own timeout and throttle, and
-			// it must never delay the session. Errors are swallowed by design.
-			void syncLibrary(dir).then((result) => {
-				if (result.verdict === "conflict") ctx.ui.notify(NOTIFY.conflict, "warning");
+		// Fire and forget: the sync has its own timeout and throttle, and
+		// it must never delay the session. Errors are swallowed by design.
+		// The ctx may go stale (reload/session switch) before the promise
+		// settles, so guard every use of it.
+		void syncLibrary(dir, { probe: { remote: probe.remote, branch: probe.branch } }).then(
+			(result) => {
+				if (result.verdict === "conflict") {
+					try {
+						ctx.ui.notify(NOTIFY.conflict, "warning");
+					} catch {
+						// Stale ctx after reload/session switch — nothing to do.
+					}
+				}
 				if (result.verdict === "ok") {
 					writeConfig({ lastSyncAt: new Date().toISOString() });
 				}
-			});
+			},
+			() => {
+				// Best-effort by design: never let a sync failure surface.
+			},
+		);
 			return;
 		}
 
@@ -276,58 +296,73 @@ async function saveSop(params: SaveParams): Promise<ToolText> {
 
 	// Whole read-modify-write window (SOP file + MANIFEST) runs in the shared
 	// per-file queue so a parallel built-in `write`/`edit` cannot lose an update.
+	// The disk write + commit + push also run under the library flock so a
+	// concurrent session_start pull (autostash window) cannot interleave with
+	// the commit (review finding: two lock systems must not be strangers).
 	return withFileMutationQueue(sopPath, async () => {
-		const { mkdirSync, writeFileSync } = await import("node:fs");
-		mkdirSync(join(dir, "sop"), { recursive: true });
-		writeFileSync(sopPath, document, "utf8");
+		const writeAndCommit = async (): Promise<ToolText> => {
+			const { mkdirSync, writeFileSync } = await import("node:fs");
+			mkdirSync(join(dir, "sop"), { recursive: true });
+			writeFileSync(sopPath, document, "utf8");
 
-		// Rebuild MANIFEST from disk (never hand-patch it) so drift self-heals.
-		const { docs } = scanSopDir(dir);
-		writeFileSync(join(dir, "MANIFEST.md"), renderManifest(docs), "utf8");
+			// Rebuild MANIFEST from disk (never hand-patch it) so drift self-heals.
+			const { docs } = scanSopDir(dir);
+			writeFileSync(join(dir, "MANIFEST.md"), renderManifest(docs), "utf8");
 
-		const commit = await commitAll(dir, `${existed ? "docs: update" : "docs: add"} SOP ${slug}`, [
-			`sop/${slug}.md`,
-			"MANIFEST.md",
-		]);
-		if (!commit.committed) {
-			return text(
-				`SOP 已写入，但 git 提交失败（${commit.detail ?? commit.reason ?? "unknown"}）。本地文件已保存：${sopPath}`,
-				{ saved: true, committed: false, slug, path: sopPath, autoInitialized },
-			);
-		}
-
-		const lines = [
-			`SOP ${existed ? "已更新" : "已保存"}：${slug}`,
-			`文件：${sopPath}`,
-			`已提交：${existed ? "docs: update" : "docs: add"} SOP ${slug}`,
-		];
-
-		// Push is best-effort; failure is reported, never fatal (design §7).
-		if (probe.remote) {
-			const pushed = await pushLibrary(dir, probe.branch);
-			if (pushed.verdict === "ok") {
-				lines.push("已推送到远端。");
-			} else {
-				lines.push(`已本地提交；推送失败（${pushed.detail ?? pushed.message}），将在下次会话重试。`);
+			const commit = await commitAll(dir, `${existed ? "docs: update" : "docs: add"} SOP ${slug}`, [
+				`sop/${slug}.md`,
+				"MANIFEST.md",
+			]);
+			if (!commit.committed) {
+				return text(
+					`SOP 已写入，但 git 提交失败（${commit.detail ?? commit.reason ?? "unknown"}）。本地文件已保存：${sopPath}`,
+					{ saved: true, committed: false, slug, path: sopPath, autoInitialized },
+				);
 			}
-		} else {
-			lines.push("库为本地模式（无远端），未推送。");
-		}
 
-		if (autoInitialized) {
-			lines.push(
-				`已自动创建本地 SOP 库 ${dir}（local-only）。提醒用户运行 /sop init 配置远端可实现多机同步。`,
+			const lines = [
+				`SOP ${existed ? "已更新" : "已保存"}：${slug}`,
+				`文件：${sopPath}`,
+				`已提交：${existed ? "docs: update" : "docs: add"} SOP ${slug}`,
+			];
+
+			// Push is best-effort; failure is reported, never fatal (design §7).
+			// alreadyLocked: we hold the library flock here, pushLibrary must
+			// not try to take it again (flock is not reentrant).
+			if (probe.remote) {
+				const pushed = await pushLibrary(dir, probe.branch, { alreadyLocked: true });
+				if (pushed.verdict === "ok") {
+					lines.push("已推送到远端。");
+				} else {
+					lines.push(`已本地提交；推送失败（${pushed.detail ?? pushed.message}），将在下次会话重试。`);
+				}
+			} else {
+				lines.push("库为本地模式（无远端），未推送。");
+			}
+
+			if (autoInitialized) {
+				lines.push(
+					`已自动创建本地 SOP 库 ${dir}（local-only）。提醒用户运行 /sop init 配置远端可实现多机同步。`,
+				);
+			}
+
+			return text(lines.join("\n"), {
+				saved: true,
+				committed: true,
+				slug,
+				path: sopPath,
+				autoInitialized,
+			});
+		};
+
+		const lock = await withLock(lockPathForDir(dir), writeAndCommit);
+		if (!lock.acquired) {
+			return text(
+				`SOP 未保存：另一进程正在同步 SOP 库，请稍后重试。`,
+				{ saved: false, reason: "locked" },
 			);
 		}
-
-		return text(lines.join("\n"), {
-			saved: true,
-			committed: true,
-			slug,
-			path: sopPath,
-			pushed: probe.remote ? true : false,
-			autoInitialized,
-		});
+		return lock.value;
 	});
 }
 
@@ -380,7 +415,7 @@ async function commandSync(ctx: ExtensionCommandContext): Promise<void> {
 		return;
 	}
 	// An explicit user action ignores the 10-minute session throttle.
-	const result = await syncLibrary(dir, { force: true });
+	const result = await syncLibrary(dir, { force: true, probe: { remote: probe.remote, branch: probe.branch } });
 	if (result.verdict === "ok") {
 		writeConfig({ lastSyncAt: new Date().toISOString() });
 		ctx.ui.notify("pi-sop: 同步完成", "info");

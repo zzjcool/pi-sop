@@ -15,7 +15,7 @@
  */
 
 import { execFile, spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -137,14 +137,6 @@ export function git(
 }
 
 /** Run git without a working tree (used before the dir exists). */
-export function gitAt(
-	dir: string | undefined,
-	args: string[],
-	timeout: number = TIMEOUTS.local,
-): Promise<GitResult> {
-	return run("git", args, { cwd: dir, timeout });
-}
-
 export function firstLine(text: string): string {
 	const line = text.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "";
 	return line.trim().slice(0, 300);
@@ -277,16 +269,16 @@ async function acquireInProcess(lockPath: string): Promise<LockHandle> {
 	const current = new Promise<void>((resolvePromise) => {
 		release = resolvePromise;
 	});
-	inProcessQueues.set(
-		lockPath,
-		previous.then(() => current),
-	);
+	// Capture the exact promise stored below; comparing a freshly created
+	// `previous.then(...)` would never match (new reference every time).
+	const chained = previous.then(() => current);
+	inProcessQueues.set(lockPath, chained);
 	await previous;
 	return {
 		acquired: true,
 		release: async () => {
 			release();
-			if (inProcessQueues.get(lockPath) === previous.then(() => current)) {
+			if (inProcessQueues.get(lockPath) === chained) {
 				inProcessQueues.delete(lockPath);
 			}
 		},
@@ -335,7 +327,10 @@ export async function pullLibrary(dir: string, branch: string | null): Promise<S
  * `SYNC_THROTTLE_MS` ago (guards `/resume` and `/fork` from re-pulling).
  * `force` bypasses the throttle for explicit user actions (`/sop sync`).
  */
-export async function syncLibrary(dir: string, options: { force?: boolean } = {}): Promise<SyncResult> {
+export async function syncLibrary(
+	dir: string,
+	options: { force?: boolean; probe?: { remote: string | null; branch: string | null } } = {},
+): Promise<SyncResult> {
 	const key = resolveGitDir(dir) ?? dir;
 	const now = Date.now();
 	const previous = lastAttempt.get(key);
@@ -347,6 +342,16 @@ export async function syncLibrary(dir: string, options: { force?: boolean } = {}
 	if (result.verdict === "failed" || result.verdict === "locked") {
 		// Do not hammer the network on a broken remote: keep the throttle window.
 		lastAttempt.set(key, now);
+		return result;
+	}
+	// Design §5: sync is pull AND push — without the push leg, local commits
+	// made on this machine silently diverge from the remote.
+	if (result.verdict === "ok" && options.probe?.remote) {
+		const branch = options.probe.branch ?? "main";
+		const push = await pushLibrary(dir, branch);
+		if (push.verdict !== "ok" && push.verdict !== "no-remote") {
+			return push;
+		}
 	}
 	return result;
 }
@@ -368,6 +373,35 @@ export async function commitAll(
 	message: string,
 	paths: string[] = ["-A"],
 ): Promise<CommitResult> {
+	// Guard 1: an in-progress rebase/merge must never be advanced by a plain
+	// `git commit` — it would silently drop the commits the rebase is replaying
+	// and leave the repo stuck mid-rebase (data loss).
+	const gitDir = resolveGitDir(dir) ?? join(dir, ".git");
+	for (const marker of ["rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD"]) {
+		if (existsSync(join(gitDir, marker))) {
+			return {
+				committed: false,
+			reason: "sync-conflict-pending",
+				detail: "库存在未解决的同步冲突（rebase/merge 进行中），请运行 /sop init 在状态面板处理",
+			};
+		}
+	}
+	// Guard 2: refuse to sweep up changes the user staged outside `paths` —
+	// a bare `git commit` commits the whole index, not just our files.
+	if (paths.length > 0 && !paths.includes("-A")) {
+		const staged = await git(dir, ["diff", "--cached", "--name-only"], TIMEOUTS.local);
+		if (staged.ok) {
+			const stagedPaths = staged.stdout.split(/\r?\n/).filter(Boolean);
+			const outside = stagedPaths.filter((p) => !paths.includes(p));
+			if (outside.length > 0) {
+				return {
+					committed: false,
+					reason: "foreign-staged-changes",
+					detail: `暂存区有本次 SOP 之外的文件（${outside.slice(0, 3).join(", ")}），已拒绝提交以免裹入`,
+				};
+			}
+		}
+	}
 	const add = await git(dir, ["add", ...paths], TIMEOUTS.local);
 	if (!add.ok) {
 		return { committed: false, reason: "add-failed", detail: firstLine(add.stderr) };
@@ -404,11 +438,15 @@ export async function commitAll(
  *
  * `dir` is the library worktree.
  */
-export async function pushLibrary(dir: string, branch: string | null): Promise<SyncResult> {
+export async function pushLibrary(
+	dir: string,
+	branch: string | null,
+	options?: { alreadyLocked?: boolean },
+): Promise<SyncResult> {
 	if (!branch) {
 		return { verdict: "no-remote", message: "无远端，仅本地提交" };
 	}
-	const lock = await withLock(lockPathForDir(dir), async () => {
+	const pushOnce = async (): Promise<SyncResult> => {
 		const result = await git(dir, ["push", "--set-upstream", "origin", branch], TIMEOUTS.push);
 		if (result.ok) return { verdict: "ok" as SyncVerdict, message: "已推送" };
 		return {
@@ -416,7 +454,9 @@ export async function pushLibrary(dir: string, branch: string | null): Promise<S
 			message: "推送失败",
 			detail: result.timedOut ? "timeout" : firstLine(result.stderr || result.stdout),
 		};
-	});
+	};
+	if (options?.alreadyLocked) return pushOnce();
+	const lock = await withLock(lockPathForDir(dir), pushOnce);
 	if (!lock.acquired) return { verdict: "locked", message: "另一进程正在同步，暂未推送" };
 	return lock.value;
 }
@@ -427,9 +467,16 @@ export async function hasGhCli(): Promise<boolean> {
 	return result.ok;
 }
 
-/** `git ls-remote <url>` pre-flight for branch 1 of the wizard. */
+/**
+ * `git ls-remote <url>` pre-flight for branch 1 of the wizard.
+ *
+ * No `--exit-code`: it exits 2 when no ref matches (e.g. an empty library
+ * repo), which is a reachable, healthy remote — not an error. Reachability is
+ * judged by exit status alone: 0 = reachable (empty output = empty repo),
+ * non-zero = unreachable/auth failure.
+ */
 export async function lsRemote(url: string): Promise<GitResult> {
-	return run("git", ["ls-remote", "--exit-code", url, "HEAD"], {
+	return run("git", ["ls-remote", url], {
 		cwd: homedir(),
 		timeout: TIMEOUTS.lsRemote,
 	});
@@ -463,9 +510,4 @@ export async function countUnpushed(dir: string, branch: string | null): Promise
 	if (!result.ok) return null;
 	const parsed = Number.parseInt(result.stdout.trim(), 10);
 	return Number.isFinite(parsed) ? parsed : null;
-}
-
-/** Serialize the library lock file name (worktree-based helper). */
-export function lockFilePath(libDir: string): string {
-	return join(resolveGitDir(libDir) ?? join(libDir, ".git"), "pi-sop.lock");
 }

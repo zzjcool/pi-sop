@@ -16,7 +16,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { rebuildManifest, renderSop } from "./sop.ts";
-import { commitAll, git, initRepo } from "./sync.ts";
+import { commitAll, initRepo } from "./sync.ts";
 
 export const MANIFEST_FILE = "MANIFEST.md";
 export const SOP_DIR = "sop";
@@ -219,17 +219,4 @@ export async function refreshManifest(
 		? await commitAll(dir, commitMessage, [MANIFEST_FILE])
 		: { committed: false };
 	return { count, changed, committed: commitResult.committed };
-}
-
-/** Ensure the library is a git repo before writing (used by autoInit). */
-export async function ensureRepo(dir: string): Promise<boolean> {
-	if (existsSync(join(dir, ".git"))) return true;
-	const result = await initRepo(dir);
-	return result.ok;
-}
-
-/** `git status --porcelain` gate used by the status panel. */
-export async function hasLocalChanges(dir: string): Promise<boolean> {
-	const result = await git(dir, ["status", "--porcelain"], 5000);
-	return result.ok && result.stdout.trim() !== "";
 }

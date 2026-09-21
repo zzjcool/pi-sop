@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { probeLibrary } from "../src/lib/probe.ts";
+import { lockPathForDir, probeLibrary } from "../src/lib/probe.ts";
 import {
 	commitAll,
 	countUnpushed,
@@ -21,7 +21,6 @@ import {
 	git,
 	initRepo,
 	looksLikeConflict,
-	lockFilePath,
 	pullLibrary,
 	pushLibrary,
 	resetSyncThrottle,
@@ -216,7 +215,7 @@ test("pullLibrary surfaces a rebase conflict instead of forcing", async () => {
 		// The lock file must live in .git, never in the worktree (nor be committed).
 		const status = await git(dir, ["status", "--porcelain"]);
 		assert.doesNotMatch(status.stdout, /pi-sop\.lock/);
-		assert.equal(lockFilePath(dir), join(dir, ".git", "pi-sop.lock"));
+		assert.equal(lockPathForDir(dir), join(dir, ".git", "pi-sop.lock"));
 	}, { remote: true });
 });
 
@@ -332,9 +331,9 @@ test("countUnpushed reports 0 when in sync and null without an upstream", async 
 	}, { remote: true });
 });
 
-test("lockFilePath lives inside the git dir, never the worktree", async () => {
+test("lockPathForDir lives inside the git dir, never the worktree", async () => {
 	await withRepo(async ({ dir }) => {
-		const lock = lockFilePath(dir);
+		const lock = lockPathForDir(dir);
 		assert.equal(lock, join(dir, ".git", "pi-sop.lock"));
 		assert.ok(!existsSync(join(dir, "pi-sop.lock")));
 	});
@@ -344,4 +343,47 @@ test("firstLine trims and caps long git error output", () => {
 	assert.equal(firstLine("\n\nfatal: nope\nsecond line"), "fatal: nope");
 	assert.equal(firstLine(""), "");
 	assert.equal(firstLine("x".repeat(500)).length, 300);
+});
+
+// ---------------------------------------------------------------------------
+// commitAll guards (review findings: rebase-in-progress + foreign staged files)
+// ---------------------------------------------------------------------------
+
+test("commitAll refuses to advance an in-progress rebase", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-sop-commitall-rebase-"));
+	await git(dir, ["init", "-q", "-b", "main"], 5000);
+	await git(dir, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "base"], 5000);
+
+	// Simulate a mid-rebase state: create rebase-merge marker like git does.
+	mkdirSync(join(dir, ".git", "rebase-merge"), { recursive: true });
+
+	const result = await commitAll(dir, "should be refused", ["-A"]);
+	assert.equal(result.committed, false);
+	assert.equal(result.reason, "sync-conflict-pending");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("commitAll refuses to sweep in foreign staged files", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-sop-commitall-staged-"));
+	await git(dir, ["init", "-q", "-b", "main"], 5000);
+	writeFileSync(join(dir, "user-work.md"), "user's own staged work\n");
+	writeFileSync(join(dir, "sop-a.md"), "sop\n");
+	await git(dir, ["add", "user-work.md"], 5000);
+
+	const result = await commitAll(dir, "add sop", ["sop-a.md"]);
+	assert.equal(result.committed, false);
+	assert.equal(result.reason, "foreign-staged-changes");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("commitAll commits when staged set matches paths", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-sop-commitall-ok-"));
+	await git(dir, ["init", "-q", "-b", "main"], 5000);
+	writeFileSync(join(dir, "sop-a.md"), "sop\n");
+	writeFileSync(join(dir, "MANIFEST.md"), "# m\n");
+	await git(dir, ["add", "sop-a.md", "MANIFEST.md"], 5000);
+
+	const result = await commitAll(dir, "add sop", ["sop-a.md", "MANIFEST.md"]);
+	assert.equal(result.committed, true);
+	rmSync(dir, { recursive: true, force: true });
 });

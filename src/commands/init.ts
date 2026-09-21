@@ -284,13 +284,13 @@ export async function cloneFlow(initialUrl: string | undefined, ctx: ExtensionCo
 	const probe = probeLibrary(targetDir);
 	if (!probe.hasManifest && !probe.hasSopDir) {
 		const repair = !interactive
-			? false
+			? probe.isRepo && probe.commitCount === 0
 			: await ctx.ui.confirm(
 					"仓库结构不像 SOP 库",
 					`${targetDir} 里没有 MANIFEST.md 也没有 sop/ 目录。\n\n补齐缺失的骨架文件？（不会覆盖已有文件）`,
 				);
-		if (repair) {
-			await scaffoldLibrary(targetDir, { init: false, commit: false, now: new Date() });
+			if (repair) {
+				await scaffoldLibrary(targetDir, { init: false, commit: true, now: new Date() });
 		} else if (!interactive) {
 			throw new Error("克隆下来的仓库缺少 SOP 库结构（无 MANIFEST.md 也无 sop/）");
 		}

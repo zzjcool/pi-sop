@@ -13,7 +13,6 @@
  */
 
 import {
-	existsSync,
 	mkdirSync,
 	readFileSync,
 	renameSync,
@@ -86,11 +85,6 @@ export function agentDir(): string {
 /** Absolute path of `pi-sop.json`. */
 export function configPath(): string {
 	return join(agentDir(), CONFIG_FILE_NAME);
-}
-
-/** True when the config file exists on disk. */
-export function configExists(): boolean {
-	return existsSync(configPath());
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -202,16 +196,6 @@ export function resolveLibDir(explicit?: string | null): ResolvedLibDir {
 		return { dir: configured, source: "config" };
 	}
 	return { dir: defaultLibDir(), source: "default" };
-}
-
-/**
- * Throw a friendly error unless `path` is an absolute, existing directory
- * (used by the wizard before scaffolding).
- */
-export function assertUsableParentDir(path: string): void {
-	if (!isAbsolute(path)) {
-		throw new Error(`库路径必须是绝对路径：${path}`);
-	}
 }
 
 /** True when `dir` exists and is a directory. */

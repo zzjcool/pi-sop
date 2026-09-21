@@ -136,3 +136,126 @@ test("assertCreatable refuses an existing populated SOP library (use --link)", (
 		assert.throws(() => assertCreatable(dir), /已存在且非空/);
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Wizard interaction branches via a scriptable fake ctx (review finding:
+// zero coverage of the ctx.ui.select/confirm/input decision paths).
+// ---------------------------------------------------------------------------
+
+import { runInit as _runInit } from "../src/commands/init.ts";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { createSandbox } from "./helpers.ts";
+
+interface ScriptedCtx {
+	mode: string;
+	hasUI: boolean;
+	ui: {
+		select: (title: string, options: string[]) => Promise<string | undefined>;
+		confirm: (title: string, message: string) => Promise<boolean>;
+		input: (title: string, placeholder?: string) => Promise<string | undefined>;
+		notify: (message: string, level: string) => void;
+	};
+	reload: () => Promise<void>;
+	reloaded: boolean;
+	notifications: string[];
+}
+
+/** Fake command ctx with pre-scripted answers, consumed in call order. */
+function scriptedCtx(options: {
+	selects?: (string | undefined)[];
+	confirms?: boolean[];
+	inputs?: (string | undefined)[];
+	mode?: string;
+}): ScriptedCtx {
+	let selectIdx = 0;
+	let confirmIdx = 0;
+	let inputIdx = 0;
+	const ctx: ScriptedCtx = {
+		mode: options.mode ?? "tui",
+		hasUI: true,
+		reloaded: false,
+		notifications: [],
+		ui: {
+			async select(_title, _opts) {
+				return options.selects?.[selectIdx++];
+			},
+			async confirm(_title, _message) {
+				return options.confirms?.[confirmIdx++] ?? false;
+			},
+			async input(_title, _placeholder) {
+				return options.inputs?.[inputIdx++];
+			},
+			notify(message, _level) {
+				ctx.notifications.push(message);
+			},
+		},
+		async reload() {
+			ctx.reloaded = true;
+		},
+	};
+	return ctx;
+}
+
+test("wizard: disable branch writes enabled=false and skips reload", async () => {
+	const sandbox = createSandbox("pi-sop-wiz-disable-");
+	process.env.PI_SOP_DIR = join(sandbox.root, "missing-lib");
+	try {
+		const ctx = scriptedCtx({ selects: ["4. 暂不使用 pi-sop"] });
+		await _runInit({ mode: "wizard" }, ctx as never);
+		assert.ok(ctx.notifications.some((n) => n.includes("已禁用")));
+		const config = JSON.parse(
+			readFileSync(join(sandbox.agentDir, "pi-sop.json"), "utf8") as string,
+		) as { enabled?: boolean };
+		assert.equal(config.enabled, false);
+		// Disable must NOT reload — nothing to re-discover.
+		assert.equal(ctx.reloaded, false);
+	} finally {
+		sandbox.cleanup();
+	}
+});
+
+test("wizard: user cancels the main menu — disk untouched", async () => {
+	const sandbox = createSandbox("pi-sop-wiz-cancel-");
+	const libDir = join(sandbox.root, "missing-lib");
+	process.env.PI_SOP_DIR = libDir;
+	try {
+		const ctx = scriptedCtx({ selects: [undefined] });
+		await _runInit({ mode: "wizard" }, ctx as never);
+		assert.equal(existsSync(libDir), false);
+		assert.equal(ctx.reloaded, false);
+	} finally {
+		sandbox.cleanup();
+	}
+});
+
+test("wizard: not-a-repo confirm-no leaves the directory alone", async () => {
+	const sandbox = createSandbox("pi-sop-wiz-notrepo-");
+	const libDir = join(sandbox.root, "has-files");
+	process.env.PI_SOP_DIR = libDir;
+	mkdirSync(libDir, { recursive: true });
+	writeFileSync(join(libDir, "random.txt"), "data");
+	try {
+		const ctx = scriptedCtx({ confirms: [false] });
+		await _runInit({ mode: "wizard" }, ctx as never);
+		assert.deepEqual(readdirSync(libDir), ["random.txt"]);
+	} finally {
+		sandbox.cleanup();
+	}
+});
+
+test("wizard: not-a-repo confirm-yes scaffolds and finishes with reload", async () => {
+	const sandbox = createSandbox("pi-sop-wiz-notrepo-yes-");
+	const libDir = join(sandbox.root, "has-files");
+	process.env.PI_SOP_DIR = libDir;
+	mkdirSync(libDir, { recursive: true });
+	writeFileSync(join(libDir, "random.txt"), "data");
+	try {
+		const ctx = scriptedCtx({ confirms: [true] });
+		await _runInit({ mode: "wizard" }, ctx as never);
+		assert.equal(ctx.reloaded, true, "finish() must reload so skillPaths register");
+		assert.ok(existsSync(join(libDir, "MANIFEST.md")));
+		assert.ok(existsSync(join(libDir, "sop", "writing-sops.md")));
+	} finally {
+		sandbox.cleanup();
+	}
+});
