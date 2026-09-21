@@ -167,7 +167,7 @@ test("pushLibrary never uses --force or a +refspec", async () => {
 test("pullLibrary succeeds on an up-to-date repo", async () => {
 	await withRepo(async ({ dir }) => {
 		await commitAll(dir, "init");
-		const result = await pullLibrary(dir, "main");
+		const result = await pullLibrary(dir);
 		// no remote configured → git pull fails, but must degrade, never throw
 		assert.ok(["failed", "conflict", "ok"].includes(result.verdict));
 	});
@@ -178,7 +178,7 @@ test("pullLibrary pulls a new commit from a real remote", async () => {
 		void root;
 		await commitAll(dir, "init");
 		await git(dir, ["push", "--set-upstream", "origin", "main"]);
-		const result = await pullLibrary(dir, "main");
+		const result = await pullLibrary(dir);
 		assert.equal(result.verdict, "ok");
 	}, { remote: true });
 });
@@ -202,7 +202,7 @@ test("pullLibrary surfaces a rebase conflict instead of forcing", async () => {
 		await commitAll(dir, "local change");
 		const localSha = (await git(dir, ["rev-parse", "HEAD"])).stdout.trim();
 
-		const result = await pullLibrary(dir, "main");
+		const result = await pullLibrary(dir);
 		assert.equal(result.verdict, "conflict");
 
 		// Frozen rule: no force, no reset. The local commit must still exist and

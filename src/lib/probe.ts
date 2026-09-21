@@ -52,8 +52,21 @@ export interface ProbeResult {
 /** States in which the library can serve skills and accept writes. */
 export const USABLE_STATES: readonly LibraryState[] = ["ready", "no-remote", "malformed"];
 
+/**
+ * States in which `sop_save` may write without asking a human. `malformed` is
+ * deliberately excluded: writing into a repo that lacks the library skeleton
+ * needs the confirm of `/sop init` (design §3.2 branch 3), not a silent tool
+ * call (review finding: agent happily committed into a random repo).
+ */
+export const SAVEABLE_STATES: readonly LibraryState[] = ["ready", "no-remote"];
+
 export function isUsable(state: LibraryState): boolean {
 	return USABLE_STATES.includes(state);
+}
+
+/** True only for states `sop_save` may write into without a human confirm. */
+export function isSaveable(state: LibraryState): boolean {
+	return SAVEABLE_STATES.includes(state);
 }
 
 function statOrNull(path: string) {
@@ -91,6 +104,25 @@ export function resolveGitDir(dir: string): string | null {
 	const target = match?.[1];
 	if (!target) return null;
 	return isAbsolute(target) ? resolve(target) : resolve(dir, target);
+}
+
+/**
+ * Resolve the common git dir (shared across linked worktrees).
+ *
+ * A linked worktree's private git dir (`.git/worktrees/<name>`) contains a
+ * `commondir` file pointing at the shared `.git`; refs and config live there.
+ * Callers that read refs/config or derive the cross-process lock MUST use the
+ * common dir, otherwise two worktrees of one repo get different locks and
+ * `refExists`/`readOriginUrl` see nothing.
+ */
+export function resolveCommonGitDir(gitDir: string): string {
+	try {
+		const content = readFileSync(join(gitDir, "commondir"), "utf8").trim();
+		if (!content) return gitDir;
+		return isAbsolute(content) ? resolve(content) : resolve(gitDir, content);
+	} catch {
+		return gitDir; // regular repo: no commondir file
+	}
 }
 
 /** Minimal git-config reader: `section.subsection.key` → value. */
@@ -160,9 +192,10 @@ function readOriginUrl(gitDir: string, configContent: string | null): string | n
 
 /** True when `ref` exists as a loose ref or inside `packed-refs`. */
 function refExists(gitDir: string, ref: string): boolean {
-	if (statOrNull(join(gitDir, ...ref.split("/")))) return true;
+	const common = resolveCommonGitDir(gitDir);
+	if (statOrNull(join(common, ...ref.split("/")))) return true;
 	try {
-		return readFileSync(join(gitDir, "packed-refs"), "utf8").includes(` ${ref}\n`);
+		return readFileSync(join(common, "packed-refs"), "utf8").includes(` ${ref}\n`);
 	} catch {
 		return false;
 	}
@@ -244,13 +277,16 @@ export function probeLibrary(dir: string): ProbeResult {
 		};
 	}
 
+	// Config lives in the COMMON dir for linked worktrees; the worktree-private
+	// git dir usually has no config file at all.
+	const commonDir = resolveCommonGitDir(gitDir);
 	let configContent: string | null = null;
 	try {
-		configContent = readFileSync(join(gitDir, "config"), "utf8");
+		configContent = readFileSync(join(commonDir, "config"), "utf8");
 	} catch {
 		configContent = null;
 	}
-	const remote = readOriginUrl(gitDir, configContent);
+	const remote = readOriginUrl(commonDir, configContent);
 	const { branch, commitCount } = readHead(gitDir);
 
 	let hasManifest = false;
@@ -324,5 +360,8 @@ export function lockPathFor(result: ProbeResult): string | null {
  * back to `<dir>/.git` for a plain checkout.
  */
 export function lockPathForDir(libDir: string): string {
-	return join(resolveGitDir(libDir) ?? join(libDir, ".git"), "pi-sop.lock");
+	// Common dir, always: linked worktrees must share ONE lock — a per-worktree
+	// path would let two pi processes race the same repo (review finding).
+	const gitDir = resolveGitDir(libDir) ?? join(libDir, ".git");
+	return join(resolveCommonGitDir(gitDir), "pi-sop.lock");
 }

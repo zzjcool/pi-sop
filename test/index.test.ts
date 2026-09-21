@@ -13,7 +13,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -553,3 +553,27 @@ async function gitClone(url: string, dest: string): Promise<boolean> {
 		return false;
 	}
 }
+
+test("sop_save refuses to write into a malformed repo (no silent scaffold)", async () => {
+	await withExtension(async ({ api, libDir }) => {
+		// A repo with commits but no MANIFEST.md / sop/ — a stranger's repo.
+		mkdirSync(libDir, { recursive: true });
+		execFileSync("git", ["init", "-q", "-b", "main"], { cwd: libDir });
+		writeFileSync(join(libDir, "README.md"), "not a sop library\n");
+		execFileSync("git", ["add", "README.md"], { cwd: libDir });
+		execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"], { cwd: libDir });
+
+		const tool = api.tools["sop_save"] as {
+			execute: (_id: string, params: Record<string, string>) => Promise<{ content: { type: string; text: string }[]; details: { saved?: boolean } }>;
+		};
+		assert.ok(tool, "sop_save tool must be registered");
+		const result = await tool.execute("t1", {
+			name: "should-be-refused",
+			description: "USE FOR testing malformed refusal",
+			content: "body",
+		});
+		assert.equal(result.details.saved, false);
+		assert.match(result.content?.[0]?.text ?? "", /缺少 SOP 库结构|sop init/);
+		assert.equal(existsSync(join(libDir, "sop")), false, "must not scaffold into the repo");
+	});
+});

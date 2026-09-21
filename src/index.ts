@@ -23,15 +23,23 @@ import { withFileMutationQueue, type ExtensionAPI, type ExtensionCommandContext 
 import { Type } from "typebox";
 
 import { parseInitArgs, runInit } from "./commands/init.ts";
-import { readConfig, resolveLibDir, writeConfig, CONFIG_VERSION } from "./lib/config.ts";
+import {
+	readConfig,
+	resolveLibDir,
+	writeConfig,
+} from "./lib/config.ts";
 import {
 	describeState,
+	isSaveable,
 	isUsable,
 	lockPathForDir,
 	probeLibrary,
 	type ProbeResult,
 } from "./lib/probe.ts";
-import { hasSkeleton, refreshManifest, scaffoldLibrary, today } from "./lib/scaffold.ts";
+import {
+	scaffoldLibrary,
+	today,
+} from "./lib/scaffold.ts";
 import {
 	countSops,
 	mostRecentVerification,
@@ -42,9 +50,7 @@ import {
 } from "./lib/sop.ts";
 import {
 	commitAll,
-	firstLine,
 	pushLibrary,
-	SYNC_THROTTLE_MS,
 	syncLibrary,
 	withLock,
 } from "./lib/sync.ts";
@@ -255,7 +261,15 @@ async function saveSop(params: SaveParams): Promise<ToolText> {
 
 	// Degradation path (design §4): knowledge capture must not be blocked by
 	// initialization state. Silent local-only scaffold, no UI at all.
-	if (!isUsable(probe.state)) {
+	// `malformed` is NOT saveable without a human confirm (SAVEABLE_STATES):
+	// agent must never silently commit into a random repo.
+	if (probe.state === "malformed") {
+		return text(
+			`目标路径已是 git 仓库但缺少 SOP 库结构（无 MANIFEST.md 也无 sop/）：${dir}。请让用户运行 /sop init 补齐骨架。`,
+			{ saved: false, reason: "malformed" },
+		);
+	}
+	if (!isSaveable(probe.state)) {
 		if (probe.state === "not-a-repo") {
 			return text(
 				`目标路径 ${dir} 存在内容但不是 git 仓库。请让用户运行 /sop init 选择「关联本机已有目录」，或将 PI_SOP_DIR 指向已有库。`,
@@ -479,8 +493,8 @@ async function commandSearch(query: string, ctx: ExtensionCommandContext): Promi
 	}
 	if (scored.length > 15) lines.push("", `…另有 ${scored.length - 15} 条，请用更具体的关键词`);
 	lines.push("", "用 read 工具打开文件查看完整步骤。");
-	// A command cannot stream multi-line UI text, so this goes out as a message
-	// the user can scroll; notify would truncate it.
+	// Multi-line results go through notify (the only channel a command
+	// context offers here); long tails are trimmed above to keep it readable.
 	pi_sendMessage(ctx, lines.join("\n"));
 }
 
@@ -488,18 +502,3 @@ async function commandSearch(query: string, ctx: ExtensionCommandContext): Promi
 function pi_sendMessage(ctx: ExtensionCommandContext, body: string): void {
 	ctx.ui.notify(body, "info");
 }
-
-/** Exported for tests. */
-export {
-	resolveState,
-	saveSop,
-	slugifySopName,
-	hasSkeleton,
-	refreshManifest,
-	renderManifest,
-	renderSop,
-	firstLine,
-	writeConfig,
-	CONFIG_VERSION,
-	SYNC_THROTTLE_MS,
-};

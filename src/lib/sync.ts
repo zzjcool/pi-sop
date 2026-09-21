@@ -284,7 +284,7 @@ async function acquireInProcess(lockPath: string): Promise<LockHandle> {
  * Never forces, never resets. A conflict is surfaced (the human resolves it from
  * the status panel); network/timeout failures degrade silently.
  */
-export async function pullLibrary(dir: string, branch: string | null): Promise<SyncResult> {
+export async function pullLibrary(dir: string): Promise<SyncResult> {
 	const lock = await withLock(lockPathForDir(dir), async () => {
 		const args = ["pull", "--rebase", "--autostash"];
 		const result = await git(dir, args, TIMEOUTS.pull);
@@ -302,7 +302,6 @@ export async function pullLibrary(dir: string, branch: string | null): Promise<S
 			detail: result.timedOut ? "timeout" : firstLine(result.stderr || result.stdout),
 		};
 	});
-	void branch;
 	if (!lock.acquired) {
 		return { verdict: "locked", message: "另一进程正在同步，已跳过" };
 	}
@@ -327,7 +326,7 @@ export async function syncLibrary(
 		return { verdict: "throttled", message: "节流中" };
 	}
 	lastAttempt.set(key, now);
-	const result = await pullLibrary(dir, null);
+	const result = await pullLibrary(dir);
 	if (result.verdict === "failed" || result.verdict === "locked") {
 		// The attempt timestamp set above already keeps the throttle window —
 		// no need to touch it again (the old second set was a same-value no-op).

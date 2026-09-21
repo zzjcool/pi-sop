@@ -565,7 +565,7 @@ async function finish(dir: string, ctx: ExtensionCommandContext, _options: Finis
 	// 1. first sync (only when a remote exists); failure is a warning, not an error
 	const probe = probeLibrary(dir);
 	if (probe.isRepo && probe.remote) {
-		const pull = await pullLibrary(dir, probe.branch);
+		const pull = await pullLibrary(dir);
 		if (pull.verdict === "conflict") ctx.ui.notify(pull.message, "warning");
 	}
 
@@ -603,7 +603,7 @@ async function statusPanel(probe: ProbeResult, ctx: ExtensionCommandContext): Pr
 			if (!probe.gitDir) continue;
 			// An explicit user action overrides the session_start throttle.
 			resetSyncThrottle();
-			const result = await pullLibrary(probe.dir, probe.branch);
+			const result = await pullLibrary(probe.dir);
 			ctx.ui.notify(result.message, result.verdict === "ok" ? "info" : "warning");
 			continue;
 		}
