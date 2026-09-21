@@ -166,6 +166,11 @@ export default function piSop(pi: ExtensionAPI): void {
 		// name and silently drops later duplicates, so the more specific
 		// (project) SOP must win over a global one of the same name.
 		const cwd = event?.cwd ?? ctx?.cwd;
+		if (!cwd) {
+			// No cwd at all (should not happen in practice): project SOPs silently
+			// unavailable — leave a breadcrumb instead of a mystery.
+			console.debug("pi-sop: resources_discover without cwd; project SOPs not loaded");
+		}
 		const paths = cwd ? existingProjectDirs(dir, cwd) : [];
 
 		const sopPath = join(dir, "sop");

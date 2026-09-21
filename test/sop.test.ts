@@ -6,7 +6,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -397,4 +397,74 @@ test("findSopConflicts is empty for a healthy cross-scope library", () => {
 		writeFileSync(join(project, "b.md"), "---\nname: b\ndescription: d\n---\n");
 		assert.deepEqual(findSopConflicts(dir), []);
 	});
+});
+
+// ---------------------------------------------------------------------------
+// Review round (project mapping): symlink skip, scope validation, port keys
+// ---------------------------------------------------------------------------
+
+test("walkProjectFiles never follows symlinks (foreign dir / cycle)", async () => {
+	const { scanSopDir } = await import("../src/lib/sop.ts");
+	const root = mkdtempSync(join(tmpdir(), "pi-sop-symlink-"));
+	const libDir = join(root, "lib");
+	// Real SOP under a valid two-segment key
+	const projDir = join(libDir, "projects", "host.example", "org", "repo");
+	mkdirSync(projDir, { recursive: true });
+	writeFileSync(join(projDir, "real.md"), "---\nname: real\ndescription: d\n---\n# real\n");
+	// Foreign directory with .md outside the library
+	const foreign = join(root, "foreign");
+	mkdirSync(foreign, { recursive: true });
+	writeFileSync(join(foreign, "outsider.md"), "---\nname: outsider\ndescription: d\n---\n");
+	// Symlink pointing outside the library must be ignored
+	symlinkSync(foreign, join(libDir, "projects", "host.example", "org", "leak"));
+	// Cyclic symlink must not multiply entries
+	symlinkSync(".", join(libDir, "projects", "host.example", "org", "repo", "loop"));
+	const { docs } = scanSopDir(libDir);
+	const names = docs.map((d) => d.name);
+	assert.ok(names.includes("real"));
+	assert.ok(!names.includes("outsider"), "symlinked foreign dir must not leak in");
+	assert.equal(names.filter((n) => n === "real").length, 1, "cyclic link must not duplicate");
+	rmSync(root, { recursive: true, force: true });
+});
+
+test("single-segment directories under projects/ are excluded (mistaken clone)", async () => {
+	const { scanSopDir } = await import("../src/lib/sop.ts");
+	const root = mkdtempSync(join(tmpdir(), "pi-sop-misclone-"));
+	const libDir = join(root, "lib");
+	// A repo cloned straight into projects/ → single-segment scope, exclude
+	const cloneDir = join(libDir, "projects", "random-repo");
+	mkdirSync(join(cloneDir, "docs"), { recursive: true });
+	writeFileSync(join(cloneDir, "README.md"), "# not a sop\n");
+	writeFileSync(join(cloneDir, "docs", "guide.md"), "# not a sop\n");
+	const { docs } = scanSopDir(libDir);
+	assert.equal(docs.length, 0, "single-segment scope must be excluded");
+	rmSync(root, { recursive: true, force: true });
+});
+
+test("normalizeProjectKey: bare host:port form matches ssh://host:port form", async () => {
+	const { normalizeProjectKey } = await import("../src/lib/project.ts");
+	assert.equal(
+		normalizeProjectKey("host:2222/org/repo.git"),
+		normalizeProjectKey("ssh://git@host:2222/org/repo.git"),
+	);
+	assert.equal(normalizeProjectKey("host:2222/org/repo.git"), "host/org/repo");
+});
+
+test("readOriginUrlFromGitDir follows [include] config via git fallback", async () => {
+	const { readOriginUrlFromGitDir } = await import("../src/lib/probe.ts");
+	const root = mkdtempSync(join(tmpdir(), "pi-sop-include-"));
+	const included = join(root, "included.conf");
+	writeFileSync(included, '[remote "origin"]\n\turl = git@example.com:org/repo.git\n');
+	const gitDir = join(root, "repo.git");
+	mkdirSync(join(gitDir, "refs", "heads"), { recursive: true });
+	mkdirSync(join(gitDir, "objects"), { recursive: true });
+	writeFileSync(join(gitDir, "HEAD"), "ref: refs/heads/main\n");
+	writeFileSync(
+		join(gitDir, "config"),
+		`[core]\n\trepositoryformatversion = 0\n[include]\n\tpath = ${included}\n`,
+	);
+	// git needs a minimally valid git dir (HEAD/refs/objects) before it will
+	// even parse the config for `--get`.
+	assert.equal(readOriginUrlFromGitDir(gitDir), "git@example.com:org/repo.git");
+	rmSync(root, { recursive: true, force: true });
 });

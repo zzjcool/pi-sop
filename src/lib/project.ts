@@ -62,7 +62,11 @@ export function normalizeProjectKey(url: string): string | null {
 	// it must be handled before generic scheme stripping.
 	const scp = /^([^/@:\s]+@)?([^/:\s]+):(?!\/)(.+)$/.exec(rest);
 	if (scp && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rest)) {
-		rest = `${scp[2]}/${scp[3]}`;
+		// A leading all-digit segment after the colon is a PORT (`host:2222/path`),
+		// not a path — strip it so the bare form matches `ssh://host:2222/path`
+		// (review finding: the two used to normalize to different keys).
+		const portMatch = /^(\d+)\/(.+)$/.exec(scp[3] ?? "");
+		rest = portMatch ? `${scp[2]}/${portMatch[2]}` : `${scp[2]}/${scp[3]}`;
 	} else {
 		// scheme form: strip `ssh://`, `https://`, `git://`, `http://`, …
 		rest = rest.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "");

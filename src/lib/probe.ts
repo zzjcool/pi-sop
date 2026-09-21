@@ -200,10 +200,11 @@ function readOriginUrl(gitDir: string, configContent: string | null): string | n
 /**
  * Read `remote.origin.url` for a git dir straight from its config file.
  *
- * Pure fs, never spawns: the project-key resolver (lib/project.ts) walks the
- * filesystem on `resources_discover` / `sop_save`, where shelling out to git
- * would be an unaffordable cost. Returns null when the config is missing or has
- * no origin (including the exotic `include` case, which we cannot follow here).
+ * Pure fs in the common case. When the config uses `[include]`/`[includeIf]`
+ * (our parser can't follow those), fall back to one bounded `git config`
+ * spawn — the same fallback `probeLibrary` uses. Without it, a repo whose
+ * origin lives in an included file would silently lose its project SOP
+ * (review finding: resolver and probe disagreed on the same config).
  */
 export function readOriginUrlFromGitDir(gitDir: string): string | null {
 	let content: string;
@@ -213,11 +214,21 @@ export function readOriginUrlFromGitDir(gitDir: string): string | null {
 		return null;
 	}
 	const values = parseGitConfig(content);
-	return (
-		configValue(values, "remote", "origin", "url") ??
-		configValue(values, "remote", "origin", "pushurl") ??
-		null
-	);
+	const direct =
+		configValue(values, "remote", "origin", "url") ?? configValue(values, "remote", "origin", "pushurl");
+	if (direct) return direct;
+	if (!/(^|\n)\s*\[include/i.test(content)) return null;
+	try {
+		const out = execFileSync("git", ["--git-dir", gitDir, "config", "--get", "remote.origin.url"], {
+			encoding: "utf8",
+			timeout: 2000,
+			stdio: ["ignore", "pipe", "ignore"],
+			env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+		});
+		return out.trim() || null;
+	} catch {
+		return null;
+	}
 }
 
 /** True when `ref` exists as a loose ref or inside `packed-refs`. */

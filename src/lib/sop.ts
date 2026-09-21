@@ -13,7 +13,7 @@
  * files without it.
  */
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { PROJECTS_DIR } from "./project.ts";
@@ -102,12 +102,24 @@ export function listSopFiles(libDir: string): ScopedFile[] {
 		// into `projects/` has no key; it is skipped rather than guessed at.
 		const slash = relative.lastIndexOf("/");
 		if (slash <= 0) continue;
-		files.push({ path: join(projectsDir, relative), scope: relative.slice(0, slash) });
+		const scope = relative.slice(0, slash);
+		// A valid key is at least `host/repo` (two segments). A repo mistakenly
+		// `git clone`d straight into `projects/` would surface as a single-segment
+		// scope with its README/docs collected as SOPs — exclude that noise.
+		if (!scope.includes("/")) continue;
+		files.push({ path: join(projectsDir, relative), scope });
 	}
 	return files;
 }
 
-/** Depth-bounded walk of `projects/`, returning posix relative file paths. */
+/** Depth-bounded walk of `projects/`, returning posix relative file paths.
+ *
+ * Symlinks are NEVER followed (review finding): a link pointing outside the
+ * library would pull foreign `.md` files into MANIFEST/search/conflict
+ * checks under a fabricated scope, and a cyclic link multiplies entries.
+ * The library is pi-sop-managed; everything under `projects/` should be
+ * regular files created by `sop_save`.
+ */
 function walkProjectFiles(root: string, prefix = "", depth = 0): string[] {
 	if (depth > 8) return []; // defensive: a pathological tree must not hang us
 	const current = prefix ? join(root, prefix) : root;
@@ -120,22 +132,12 @@ function walkProjectFiles(root: string, prefix = "", depth = 0): string[] {
 	const found: string[] = [];
 	for (const entry of entries) {
 		if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+		// Symlinks (file or dir): skip entirely — see the doc comment above.
+		if (entry.isSymbolicLink()) continue;
 		const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
-		const absolute = join(root, relative);
-		let isDirectory = entry.isDirectory();
-		let isFile = entry.isFile();
-		if (entry.isSymbolicLink()) {
-			try {
-				const stat = statSync(absolute);
-				isDirectory = stat.isDirectory();
-				isFile = stat.isFile();
-			} catch {
-				continue; // broken symlink
-			}
-		}
-		if (isDirectory) {
+		if (entry.isDirectory()) {
 			found.push(...walkProjectFiles(root, relative, depth + 1));
-		} else if (isFile && entry.name.endsWith(".md")) {
+		} else if (entry.isFile() && entry.name.endsWith(".md")) {
 			found.push(relative);
 		}
 	}
