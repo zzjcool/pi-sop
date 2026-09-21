@@ -7,6 +7,7 @@ Base：`dea98cf chore: prepare for npm publish`（未改动的 `main`）
 - `64adcfa docs: add implementation report`
 - `069d7d0 feat: project-scoped SOP mapping + multi-language conventions`
 - `de96095 fix: canonical path comparison in the duplicate guard, findNameConflicts`
+- `ceb9072` / `5d0471d` docs: report corrections (commit refs + the worktree slip note)
 
 ---
 
@@ -128,7 +129,11 @@ ok 189 - run() timeout kills a hanging child and reports timedOut
 - **创建 PR**：https://github.com/zzjcool/pi-sop/compare/main...pi-subagent/worker-1-c0ad8f7e?expand=1
 - **分支**：https://github.com/zzjcool/pi-sop/tree/pi-subagent/worker-1-c0ad8f7e
 - Base = `main`（`dea98cf`，本分支的直接祖先，可安全作为 base）
-- push 记录：`* [new branch] pi-subagent/worker-1-c0ad8f7e -> pi-subagent/worker-1-c0ad8f7e`（无 `--force`，未 push main，未本地 merge）
+- push 记录（均无 `--force`，未 push main，未本地 merge）：
+  - `* [new branch] pi-subagent/worker-1-c0ad8f7e -> pi-subagent/worker-1-c0ad8f7e`
+  - `64adcfa..de96095`（把实现提交补进分支）
+  - `de96095..ceb9072`、`ceb9072..5d0471d`（报告修正）
+- 远端当前 `refs/heads/pi-subagent/worker-1-c0ad8f7e` = `5d0471d`；`refs/heads/main` 仍为 `dea98cf`（未被触碰）
 
 ---
 
