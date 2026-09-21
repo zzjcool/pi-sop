@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { describeState, isUsable, lockPathFor, probeLibrary } from "../src/lib/probe.ts";
+import { describeState, isUsable, lockPathFor, probeLibrary, readOriginUrlFromGitDir } from "../src/lib/probe.ts";
 
 function tempDir(prefix = "pi-sop-probe-"): string {
 	return mkdtempSync(join(tmpdir(), prefix));
@@ -161,6 +161,63 @@ test("a scaffolded library without remote probes as no-remote (still usable)", (
 		writeFileSync(join(dir, "MANIFEST.md"), "| a |");
 		mkdirSync(join(dir, "sop"), { recursive: true });
 		assert.equal(probeLibrary(dir).state, "no-remote");
+	});
+});
+
+test("projects/ alone is legal structure (backward-compatible layout)", () => {
+	withDir((dir) => {
+		git(dir, ["init", "-b", "main"]);
+		git(dir, ["remote", "add", "origin", "https://example.com/lib.git"]);
+		// No sop/ and no MANIFEST yet: a fresh library whose only content is a
+		// project-scoped SOP must not be reported as malformed.
+		mkdirSync(join(dir, "projects", "host", "org", "repo"), { recursive: true });
+		writeFileSync(
+			join(dir, "projects", "host", "org", "repo", "a.md"),
+			"---\nname: a\ndescription: d\n---\n",
+		);
+		const result = probeLibrary(dir);
+		assert.equal(result.state, "ready");
+		assert.equal(result.hasProjectsDir, true);
+		assert.equal(result.hasSopDir, false);
+	});
+});
+
+test("an old library without projects/ is unchanged (no regression)", () => {
+	withDir((dir) => {
+		git(dir, ["init", "-b", "main"]);
+		git(dir, ["remote", "add", "origin", "https://example.com/lib.git"]);
+		writeFileSync(join(dir, "MANIFEST.md"), "| a |");
+		const result = probeLibrary(dir);
+		assert.equal(result.state, "ready");
+		assert.equal(result.hasProjectsDir, false);
+	});
+});
+
+test("readOriginUrlFromGitDir reads origin without spawning git", () => {
+	withDir((dir) => {
+		git(dir, ["init", "-b", "main"]);
+		git(dir, ["remote", "add", "origin", "git@git.woa.com:csig/tdmq.git"]);
+		assert.equal(readOriginUrlFromGitDir(join(dir, ".git")), "git@git.woa.com:csig/tdmq.git");
+	});
+});
+
+test("readOriginUrlFromGitDir returns null without origin / without config", () => {
+	withDir((dir) => {
+		git(dir, ["init", "-b", "main"]);
+		assert.equal(readOriginUrlFromGitDir(join(dir, ".git")), null);
+		assert.equal(readOriginUrlFromGitDir(join(dir, "nope")), null);
+	});
+});
+
+test("readOriginUrlFromGitDir prefers url and falls back to pushurl", () => {
+	withDir((dir) => {
+		const gitDir = join(dir, "g");
+		mkdirSync(gitDir);
+		writeFileSync(
+			join(gitDir, "config"),
+			['[remote "origin"]', "\tpushurl = git@host:org/push-only.git", ""].join("\n"),
+		);
+		assert.equal(readOriginUrlFromGitDir(gitDir), "git@host:org/push-only.git");
 	});
 });
 

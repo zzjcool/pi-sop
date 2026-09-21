@@ -89,12 +89,12 @@ test("the seed SOP has frontmatter pi will accept as a skill", async () => {
 	});
 });
 
-test("MANIFEST indexes the seed SOP with all four columns", async () => {
+test("MANIFEST indexes the seed SOP with all five columns", async () => {
 	await withDir(async ({ dir }) => {
 		await scaffoldLibrary(dir, { now: FIXED_DATE });
 		const manifest = readFileSync(join(dir, MANIFEST_FILE), "utf8");
-		assert.match(manifest, /\| name \| description \| triggers \| last_verified \|/);
-		assert.match(manifest, /\| writing-sops \|/);
+		assert.match(manifest, /\| name \| scope \| description \| triggers \| last_verified \|/);
+		assert.match(manifest, /\| writing-sops \| global \|/);
 		assert.match(manifest, /\| 2026-09-21 \|/);
 		// the generated date is injectable, so output is deterministic under test
 		assert.match(manifest, /2026-09-21T07:00:00\.000Z/);
@@ -225,6 +225,24 @@ test("seed body documents all four frontmatter fields", () => {
 	for (const key of ["name", "description", "triggers", "last_verified"]) {
 		assert.ok(body.includes(key), `seed body should mention ${key}`);
 	}
+});
+
+test("seed body carries the multi-language conventions", () => {
+	const body = seedSopBody();
+	assert.match(body, /## Language/);
+	assert.match(body, /正文单语/);
+	assert.match(body, /triggers/, "triggers 混语言规则要写清楚");
+	assert.match(body, /英文 \| 中文/);
+	// the rules the design explicitly rejected must be stated as rejected, not
+	// silently omitted (an agent reading this seed is the one writing new SOPs)
+	assert.match(body, /zh-CN/);
+});
+
+test("seed body documents the project scope and its uniqueness rule", () => {
+	const body = seedSopBody();
+	assert.match(body, /projects\/<项目键>\//);
+	assert.match(body, /project=true/);
+	assert.match(body, /不允许同名/);
 });
 
 test(".gitignore ignores OS noise and the lock file", () => {

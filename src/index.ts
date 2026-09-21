@@ -17,7 +17,7 @@
  */
 
 import { join, resolve } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 
 import { withFileMutationQueue, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -41,6 +41,9 @@ import {
 	today,
 } from "./lib/scaffold.ts";
 import {
+	findNameConflict,
+	findSopConflicts,
+	GLOBAL_SCOPE,
 	countSops,
 	mostRecentVerification,
 	renderManifest,
@@ -48,6 +51,11 @@ import {
 	scanSopDir,
 	slugifySopName,
 } from "./lib/sop.ts";
+import {
+	existingProjectDirs,
+	projectDir,
+	resolveProjectKeys,
+} from "./lib/project.ts";
 import {
 	commitAll,
 	pushLibrary,
@@ -67,9 +75,13 @@ const NOTIFY = {
 /** Once-per-process flag: `resume`/`fork` must not re-notify. */
 let notifiedUninitialized = false;
 
+/** Conflict signatures already warned about in this process. */
+const reportedConflicts = new Set<string>();
+
 /** Test seam: allow re-notifying in a fresh process-like context. */
 export function resetNotifyFlag(): void {
 	notifiedUninitialized = false;
+	reportedConflicts.clear();
 }
 
 /** ------------------------------------------------------------------ */
@@ -100,8 +112,14 @@ export default function piSop(pi: ExtensionAPI): void {
 		if (config.enabled === false) return;
 
 		const { dir, probe } = resolveState();
+		if (isSaveable(probe.state)) {
+			// Duplicate-name guard, fs-only and best-effort: `sop_save` refuses such
+			// writes, but a hand-written file can still collide, and pi silently
+			// drops the loser skill (first registration wins). Never prompts.
+			warnOnConflicts(dir, ctx);
+		}
 		if (probe.state === "ready") {
-		// Fire and forget: the sync has its own timeout and throttle, and
+			// Fire and forget: the sync has its own timeout and throttle, and
 		// it must never delay the session. Errors are swallowed by design.
 		// The ctx may go stale (reload/session switch) before the promise
 		// settles, so guard every use of it.
@@ -118,10 +136,10 @@ export default function piSop(pi: ExtensionAPI): void {
 					writeConfig({ lastSyncAt: new Date().toISOString() });
 				}
 			},
-			() => {
-				// Best-effort by design: never let a sync failure surface.
-			},
-		);
+				() => {
+					// Best-effort by design: never let a sync failure surface.
+				},
+			);
 			return;
 		}
 
@@ -135,17 +153,26 @@ export default function piSop(pi: ExtensionAPI): void {
 	});
 
 	// ---------------------------------------------------------------- //
-	// 2. resources_discover: register <libDir>/sop as a skill path       //
+	// 2. resources_discover: register project SOPs + <libDir>/sop         //
 	// ---------------------------------------------------------------- //
-	pi.on("resources_discover", async () => {
+	pi.on("resources_discover", async (event, ctx) => {
 		const config = readConfig();
 		if (config.enabled === false) return {};
 		const { dir, probe } = resolveState();
 		// Only expose the skill path when the library can actually serve it.
 		if (!isUsable(probe.state)) return {};
+
+		// Project SOPs first: pi's loader keeps the FIRST skill registered under a
+		// name and silently drops later duplicates, so the more specific
+		// (project) SOP must win over a global one of the same name.
+		const cwd = event?.cwd ?? ctx?.cwd;
+		const paths = cwd ? existingProjectDirs(dir, cwd) : [];
+
 		const sopPath = join(dir, "sop");
-		if (!existsSync(sopPath)) return {};
-		return { skillPaths: [sopPath] };
+		if (existsSync(sopPath)) paths.push(sopPath);
+		// A library without the global dir but with project SOPs is still usable.
+		if (paths.length === 0) return {};
+		return { skillPaths: paths };
 	});
 
 	// ---------------------------------------------------------------- //
@@ -181,9 +208,15 @@ export default function piSop(pi: ExtensionAPI): void {
 			last_verified: Type.Optional(
 				Type.String({ description: "Verification date YYYY-MM-DD. Defaults to today." }),
 			),
+			project: Type.Optional(
+				Type.Boolean({
+					description:
+						"Set true ONLY when the SOP documents a workflow specific to the git repository you are currently working in (deploy steps, env quirks of this repo). The project is derived from that repo's origin URL automatically; there is no need to pass a project name. Defaults to false = the global SOP library shared by all projects.",
+				}),
+			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			return saveSop(params);
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return saveSop(params, ctx?.cwd);
 		},
 	});
 
@@ -217,7 +250,7 @@ export default function piSop(pi: ExtensionAPI): void {
 					ctx.ui.notify(
 						[
 							"pi-sop: /sop init 初始化向导 · /sop status 状态 · /sop sync 同步",
-							"/sop <关键词> 在库中检索 SOP",
+							"/sop <关键词> 在库中检索 SOP（含项目专属 SOP，结果标注范围）",
 						].join("\n"),
 						"info",
 					);
@@ -231,6 +264,49 @@ export default function piSop(pi: ExtensionAPI): void {
 }
 
 /** ------------------------------------------------------------------ */
+/** session_start conflict warning (fs-only, best-effort)                  */
+/** ------------------------------------------------------------------ */
+
+/**
+ * Warn once per (process, conflict-set) when two SOPs share a frontmatter name.
+ *
+ * This is the safety net for files a human added by hand: `sop_save` refuses
+ * such writes up front, but nothing stops a manual `cp`. pi's loader keeps the
+ * first registration and silently drops the loser, so the only symptom is a
+ * skill quietly going missing — worth one non-blocking notify.
+ */
+function warnOnConflicts(dir: string, ctx: { ui?: { notify(text: string, type?: string): void } }): void {	let conflicts;
+	try {
+		conflicts = findSopConflicts(dir);
+	} catch {
+		return; // never let a scan failure touch session start
+	}
+	if (conflicts.length === 0) return;
+	const signature = conflicts
+		.map((conflict) => `${conflict.name}:${conflict.occurrences.map((o) => o.filePath).join(",")}`)
+		.join("|");
+	if (reportedConflicts.has(signature)) return;
+	reportedConflicts.add(signature);
+
+	const lines = [
+		`pi-sop: 发现 ${conflicts.length} 组重名 SOP（同名 skill 只有先注册者生效，其余会被静默丢弃）：`,
+	];
+	for (const conflict of conflicts.slice(0, 5)) {
+		lines.push(`• ${conflict.name}`);
+		for (const occurrence of conflict.occurrences) {
+			lines.push(`  [${occurrence.scope}] ${occurrence.filePath}`);
+		}
+	}
+	if (conflicts.length > 5) lines.push(`…另有 ${conflicts.length - 5} 组`);
+	lines.push("请重命名其中之一（如加项目前缀）。");
+	try {
+		ctx?.ui?.notify(lines.join("\n"), "warning");
+	} catch {
+		// Stale ctx after reload/session switch — nothing to do.
+	}
+}
+
+/** ------------------------------------------------------------------ */
 /** sop_save implementation                                              */
 /** ------------------------------------------------------------------ */
 
@@ -240,6 +316,8 @@ interface SaveParams {
 	content: string;
 	triggers?: string;
 	last_verified?: string;
+	/** Write into `projects/<key>/` of the current repo instead of global `sop/`. */
+	project?: boolean;
 }
 
 interface ToolText {
@@ -251,7 +329,7 @@ function text(message: string, details: Record<string, unknown> = {}): ToolText 
 	return { content: [{ type: "text", text: message }], details };
 }
 
-async function saveSop(params: SaveParams): Promise<ToolText> {
+async function saveSop(params: SaveParams, cwd?: string): Promise<ToolText> {
 	const config = readConfig();
 	if (config.enabled === false) return text(NOTIFY.disabledSave, { saved: false, reason: "disabled" });
 
@@ -304,7 +382,44 @@ async function saveSop(params: SaveParams): Promise<ToolText> {
 		);
 	}
 
-	const sopPath = resolve(dir, "sop", `${slug}.md`);
+	// Scope resolution. `project: true` is an explicit opt-in (default stays
+	// global): a mis-guessed project dir is much worse than a too-broad global
+	// SOP, so the agent must say so on purpose.
+	let scope = GLOBAL_SCOPE;
+	let targetDir = resolve(dir, "sop");
+	if (params.project) {
+		const keys = resolveProjectKeys(cwd ?? process.cwd());
+		if (keys.length === 0) {
+			return text(
+				`无法写入项目 SOP：当前目录（${cwd ?? process.cwd()}）向上没有找到带 origin 远端的 git 仓库。\n` +
+					`请确认在项目仓库内，或去掉 project 参数写入全局 sop/。`,
+				{ saved: false, reason: "no-project" },
+			);
+		}
+		// Most specific key wins (submodule dir before its parent repo).
+		scope = keys[0] as string;
+		targetDir = projectDir(dir, scope);
+	}
+
+	const sopPath = resolve(targetDir, `${slug}.md`);
+
+	// Duplicate-name guard. pi keeps the FIRST skill registered under a name and
+	// silently drops the rest (verified behavior), so a second file with the same
+	// frontmatter name is a silent loss, not a harmless copy. Refuse instead.
+	// Rewriting the *same* file is obviously allowed.
+	const clash = findNameConflict(dir, slug);
+	if (clash && resolve(clash.filePath) !== sopPath) {
+		// Suggest a prefix taken from the OTHER scope's project name — that is the
+		// distinction the two files actually encode.
+		const otherKey = clash.scope === GLOBAL_SCOPE ? scope : clash.scope;
+		const prefix = otherKey === GLOBAL_SCOPE ? "" : `${otherKey.split("/").pop()}-`;
+		return text(
+			`SOP 名称冲突：「${slug}」已存在于 ${clash.scope === GLOBAL_SCOPE ? "全局 sop/" : `项目 ${clash.scope}`}：${clash.filePath}。\n` +
+				`同名 skill 会被 pi 静默去重（先注册者胜出），所以请改名，例如：${prefix}${slug}。`,
+			{ saved: false, reason: "name-conflict", conflict: clash.filePath },
+		);
+	}
+
 	const existed = existsSync(sopPath);
 	const lastVerified = (params.last_verified ?? today()).trim() || today();
 	const document = renderSop({
@@ -323,27 +438,30 @@ async function saveSop(params: SaveParams): Promise<ToolText> {
 	return withFileMutationQueue(sopPath, async () => {
 		const writeAndCommit = async (): Promise<ToolText> => {
 			const { mkdirSync, writeFileSync } = await import("node:fs");
-			mkdirSync(join(dir, "sop"), { recursive: true });
+			mkdirSync(targetDir, { recursive: true });
 			writeFileSync(sopPath, document, "utf8");
 
 			// Rebuild MANIFEST from disk (never hand-patch it) so drift self-heals.
+			// The manifest indexes every scope, hence the whole-library scan.
 			const { docs } = scanSopDir(dir);
 			writeFileSync(join(dir, "MANIFEST.md"), renderManifest(docs), "utf8");
 
+			const relativePath = relativeTo(dir, sopPath);
 			const commit = await commitAll(dir, `${existed ? "docs: update" : "docs: add"} SOP ${slug}`, [
-				`sop/${slug}.md`,
+				relativePath,
 				"MANIFEST.md",
 			]);
 			if (!commit.committed) {
 				return text(
 					`SOP 已写入，但 git 提交失败（${commit.detail ?? commit.reason ?? "unknown"}）。本地文件已保存：${sopPath}`,
-					{ saved: true, committed: false, slug, path: sopPath, autoInitialized },
+					{ saved: true, committed: false, slug, path: sopPath, scope, autoInitialized },
 				);
 			}
 
 			const lines = [
 				`SOP ${existed ? "已更新" : "已保存"}：${slug}`,
 				`文件：${sopPath}`,
+				`范围：${scope === GLOBAL_SCOPE ? "全局（所有项目）" : `项目 ${scope}`}`,
 				`已提交：${existed ? "docs: update" : "docs: add"} SOP ${slug}`,
 			];
 
@@ -372,6 +490,7 @@ async function saveSop(params: SaveParams): Promise<ToolText> {
 				committed: true,
 				slug,
 				path: sopPath,
+				scope,
 				autoInitialized,
 			});
 		};
@@ -401,20 +520,19 @@ async function commandStatus(ctx: ExtensionCommandContext): Promise<void> {
 	];
 	if (probe.remote) lines.push(`远端:   ${probe.remote} (${probe.branch ?? "?"})`);
 	if (isUsable(probe.state)) {
+		const { docs } = scanSopDir(dir);
 		lines.push(`SOP 数量: ${countSops(dir)}`);
-		const recent = mostRecentlyVerified(dir);
-		if (recent) lines.push(`最近验证: ${recent}`);
+		const projectScopes = new Set(docs.filter((doc) => doc.scope !== GLOBAL_SCOPE).map((doc) => doc.scope));
+		if (projectScopes.size > 0) {
+			lines.push(`项目专属: ${projectScopes.size} 个项目目录`);
+		}
+		const recent = mostRecentVerification(docs);
+		if (recent) lines.push(`最近验证: ${recent.name} (${recent.date})`);
 		if (config.lastSyncAt) lines.push(`上次同步: ${config.lastSyncAt}`);
 	} else {
 		lines.push("提示: 运行 /sop init 初始化 SOP 库");
 	}
 	ctx.ui.notify(lines.join("\n"), config.enabled ? "info" : "warning");
-}
-
-function mostRecentlyVerified(dir: string): string | null {
-	// Same logic as the status panel — use the shared helper, not a twin copy.
-	const best = mostRecentVerification(scanSopDir(dir).docs);
-	return best ? `${best.name} (${best.date})` : null;
 }
 
 /** ------------------------------------------------------------------ */
@@ -453,7 +571,8 @@ async function commandSync(ctx: ExtensionCommandContext): Promise<void> {
  * Grep the library for humans. The library is small (dozens of files), so a
  * case-insensitive substring scan over frontmatter + body is enough and needs no
  * index. Results are ranked: name match, then triggers, then description, then
- * body.
+ * body. Every hit is labelled with its scope (global vs. project key) because
+ * the same keyword may exist in both worlds.
  */
 async function commandSearch(query: string, ctx: ExtensionCommandContext): Promise<void> {
 	const { dir, probe } = resolveState();
@@ -485,7 +604,7 @@ async function commandSearch(query: string, ctx: ExtensionCommandContext): Promi
 
 	const lines = [`SOP 检索「${query}」— ${scored.length}/${docs.length} 条匹配:`, ""];
 	for (const { doc } of scored.slice(0, 15)) {
-		lines.push(`• ${doc.name}`);
+		lines.push(`• ${doc.name}  [${scopeLabel(doc.scope)}]`);
 		lines.push(`  ${doc.description}`);
 		if (doc.triggers) lines.push(`  triggers: ${doc.triggers}`);
 		if (doc.lastVerified) lines.push(`  last_verified: ${doc.lastVerified}`);
@@ -496,6 +615,34 @@ async function commandSearch(query: string, ctx: ExtensionCommandContext): Promi
 	// Multi-line results go through notify (the only channel a command
 	// context offers here); long tails are trimmed above to keep it readable.
 	pi_sendMessage(ctx, lines.join("\n"));
+}
+
+/** Short scope label for search output. */
+function scopeLabel(scope: string): string {
+	return scope === GLOBAL_SCOPE ? "全局" : `项目: ${scope}`;
+}
+
+/**
+ * Path of `target` relative to `dir`, as git wants it in `git add`.
+ *
+ * `projectDir` exits through `realpath`, so under a symlinked library the two
+ * can differ lexically while pointing at the same file; try both spellings
+ * before falling back to the absolute path (which git can still handle, but
+ * which would look wrong in a commit message).
+ */
+function relativeTo(dir: string, target: string): string {
+	for (const base of [resolve(dir), canonical(dir)]) {
+		if (target.startsWith(`${base}/`)) return target.slice(base.length + 1);
+	}
+	return target;
+}
+
+function canonical(path: string): string {
+	try {
+		return realpathSync(resolve(path));
+	} catch {
+		return resolve(path);
+	}
 }
 
 /** Commands have no access to `pi` here; keep the notify fallback simple. */

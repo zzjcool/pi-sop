@@ -13,7 +13,12 @@ import { test } from "node:test";
 
 import {
 	countSops,
+	descriptionHead,
+	findNameConflict,
+	findSopConflicts,
+	GLOBAL_SCOPE,
 	isValidSopName,
+	listSopFiles,
 	mostRecentVerification,
 	parseSop,
 	readSopFile,
@@ -187,24 +192,64 @@ test("countSops counts only markdown files", () => {
 	});
 });
 
-test("renderManifest emits a four-column table sorted by name", () => {
+test("renderManifest emits a five-column table (scope included) sorted by name", () => {
 	const docs = [
-		{ name: "zebra", description: "z", triggers: "t", lastVerified: "2026-01-01", filePath: "/z", slug: "zebra", body: "" },
-		{ name: "alpha", description: "a", triggers: "t", lastVerified: "2026-01-02", filePath: "/a", slug: "alpha", body: "" },
+		{ name: "zebra", scope: "global", description: "z", triggers: "t", lastVerified: "2026-01-01", filePath: "/z", slug: "zebra", body: "" },
+		{ name: "alpha", scope: "global", description: "a", triggers: "t", lastVerified: "2026-01-02", filePath: "/a", slug: "alpha", body: "" },
 	];
 	const manifest = renderManifest(docs, "2026-09-21T00:00:00.000Z");
-	assert.match(manifest, /\| name \| description \| triggers \| last_verified \|/);
+	assert.match(manifest, /\| name \| scope \| description \| triggers \| last_verified \|/);
 	const alphaIndex = manifest.indexOf("| alpha |");
 	const zebraIndex = manifest.indexOf("| zebra |");
 	assert.ok(alphaIndex < zebraIndex, "rows sorted alphabetically");
 	assert.match(manifest, /最后生成: 2026-09-21T00:00:00\.000Z/);
 });
 
-test("renderManifest escapes pipes so a description cannot break the table", () => {
+test("renderManifest labels the scope of a project SOP with its project key", () => {
+	const docs = [
+		{
+			name: "tdmq-deploy",
+			scope: "git.woa.com/csig_tdmq/tdmq-appserver",
+			description: "d",
+			triggers: "t",
+			lastVerified: "2026-01-01",
+			filePath: "/p",
+			slug: "tdmq-deploy",
+			body: "",
+		},
+	];
+	const row = renderManifest(docs).split("\n").find((line) => line.startsWith("| tdmq-deploy |"));
+	assert.ok(row);
+	assert.match(row, /\| git\.woa\.com\/csig_tdmq\/tdmq-appserver \|/);
+});
+
+test("renderManifest shows only the English segment of a bilingual description", () => {
+	const docs = [
+		{
+			name: "bilingual",
+			scope: "global",
+			description: "USE FOR thing | 用于某件事",
+			triggers: "",
+			lastVerified: "",
+			filePath: "/b",
+			slug: "bilingual",
+			body: "",
+		},
+	];
+	const row = renderManifest(docs).split("\n").find((line) => line.startsWith("| bilingual |"));
+	assert.ok(row);
+	// The table stays narrow; pi itself still reads the full bilingual value
+	// from the SOP frontmatter (only the MANIFEST projection is trimmed).
+	assert.match(row, /USE FOR thing \|/);
+	assert.doesNotMatch(row, /用于某件事/);
+});
+
+test("renderManifest escapes pipes so a cell value cannot break the table", () => {
 	const docs = [
 		{
 			name: "piped",
-			description: "a | b | c",
+			scope: "global",
+			description: "no pipes here",
 			triggers: "x|y",
 			lastVerified: "2026-01-01",
 			filePath: "/p",
@@ -218,8 +263,15 @@ test("renderManifest escapes pipes so a description cannot break the table", () 
 	// Every non-delimiter pipe must be escaped, otherwise a cell value would
 	// silently create extra columns.
 	const withoutEscaped = row.replaceAll("\\|", "\u0000");
-	assert.equal(withoutEscaped.split("|").length - 2, 4, "still exactly four cells");
-	assert.match(row, /a \\\| b \\\| c/);
+	assert.equal(withoutEscaped.split("|").length - 2, 5, "still exactly five cells");
+	assert.match(row, /x\\\|y/);
+});
+
+test("descriptionHead falls back to the full text when the first segment is empty", () => {
+	assert.equal(descriptionHead("English part | 中文部分"), "English part");
+	assert.equal(descriptionHead("only english"), "only english");
+	assert.equal(descriptionHead("| 只有中文"), "| 只有中文");
+	assert.equal(descriptionHead("line one\nline two"), "line one line two");
 });
 
 test("renderManifest has an explicit empty marker", () => {
@@ -231,6 +283,7 @@ test("renderManifest flattens newlines so rows stay single-line", () => {
 	const docs = [
 		{
 			name: "multi",
+			scope: "global",
 			description: "line one\nline two",
 			triggers: "",
 			lastVerified: "",
@@ -247,7 +300,7 @@ test("renderManifest flattens newlines so rows stay single-line", () => {
 
 test("mostRecentVerification picks the newest date", () => {
 	const make = (name: string, date: string) =>
-		({ name, description: "", triggers: "", lastVerified: date, filePath: `/${name}`, slug: name, body: "" });
+		({ name, scope: "global", description: "", triggers: "", lastVerified: date, filePath: `/${name}`, slug: name, body: "" });
 	assert.equal(mostRecentVerification([]), null);
 	assert.equal(mostRecentVerification([make("a", "")]), null);
 	const result = mostRecentVerification([make("old", "2026-01-01"), make("new", "2026-09-01")]);
@@ -257,4 +310,88 @@ test("mostRecentVerification picks the newest date", () => {
 test("readSopFile returns an issue for a missing file", () => {
 	const result = readSopFile("/definitely/not/here.md");
 	assert.ok("issue" in result);
+});
+
+test("readSopFile stamps the scope it is given (global by default)", () => {
+	withSopDir((dir) => {
+		const path = join(dir, "sop", "scoped.md");
+		writeFileSync(path, "---\nname: scoped\ndescription: d\n---\n");
+		const viaDefault = readSopFile(path);
+		assert.ok("doc" in viaDefault);
+		assert.equal(viaDefault.doc.scope, GLOBAL_SCOPE);
+		const viaArg = readSopFile(path, "git.woa.com/org/repo");
+		assert.ok("doc" in viaArg);
+		assert.equal(viaArg.doc.scope, "git.woa.com/org/repo");
+	});
+});
+
+test("scanSopDir reads global + nested project SOPs, each with its scope", () => {
+	withSopDir((dir) => {
+		writeFileSync(join(dir, "sop", "global-one.md"), "---\nname: global-one\ndescription: d\n---\n");
+		const project = join(dir, "projects", "git.woa.com", "org", "repo");
+		mkdirSync(project, { recursive: true });
+		writeFileSync(join(project, "proj-one.md"), "---\nname: proj-one\ndescription: d\n---\n");
+		// a file directly in projects/ has no key ⇒ ignored, not guessed
+		writeFileSync(join(dir, "projects", "stray.md"), "---\nname: stray\ndescription: d\n---\n");
+		const result = scanSopDir(dir);
+		const byName = new Map(result.docs.map((doc) => [doc.name, doc.scope]));
+		assert.equal(byName.get("global-one"), "global");
+		assert.equal(byName.get("proj-one"), "git.woa.com/org/repo");
+		assert.equal(byName.has("stray"), false);
+	});
+});
+
+test("listSopFiles lists every scope and skips non-markdown + dotfiles", () => {
+	withSopDir((dir) => {
+		writeFileSync(join(dir, "sop", "a.md"), "x");
+		writeFileSync(join(dir, "sop", "notes.txt"), "x");
+		writeFileSync(join(dir, "sop", ".hidden.md"), "x");
+		const project = join(dir, "projects", "host", "org", "repo");
+		mkdirSync(project, { recursive: true });
+		writeFileSync(join(project, "b.md"), "x");
+		const files = listSopFiles(dir);
+		assert.deepEqual(files.map((f) => f.scope), ["global", "host/org/repo"]);
+		assert.equal(countSops(dir), 2);
+	});
+});
+
+test("countSops counts every scope", () => {
+	withSopDir((dir) => {
+		writeFileSync(join(dir, "sop", "a.md"), "x");
+		mkdirSync(join(dir, "projects", "h", "o", "r"), { recursive: true });
+		writeFileSync(join(dir, "projects", "h", "o", "r", "b.md"), "x");
+		writeFileSync(join(dir, "projects", "h", "o", "r", "c.md"), "x");
+		assert.equal(countSops(dir), 3);
+	});
+});
+
+test("findSopConflicts reports a name present in two scopes, with both paths", () => {
+	withSopDir((dir) => {
+		writeFileSync(join(dir, "sop", "shared.md"), "---\nname: shared\ndescription: d\n---\n");
+		const project = join(dir, "projects", "host", "org", "repo");
+		mkdirSync(project, { recursive: true });
+		writeFileSync(join(project, "shared.md"), "---\nname: shared\ndescription: d2\n---\n");
+		writeFileSync(join(dir, "sop", "unique.md"), "---\nname: unique\ndescription: d\n---\n");
+		const conflicts = findSopConflicts(dir);
+		assert.equal(conflicts.length, 1);
+		assert.equal(conflicts[0]?.name, "shared");
+		assert.deepEqual(
+			conflicts[0]?.occurrences.map((o) => o.scope),
+			["global", "host/org/repo"],
+		);
+		// the guard consults the same data
+		assert.equal(findNameConflict(dir, "shared")?.scope, "global");
+		assert.equal(findNameConflict(dir, "unique")?.scope, "global");
+		assert.equal(findNameConflict(dir, "absent"), null);
+	});
+});
+
+test("findSopConflicts is empty for a healthy cross-scope library", () => {
+	withSopDir((dir) => {
+		writeFileSync(join(dir, "sop", "a.md"), "---\nname: a\ndescription: d\n---\n");
+		const project = join(dir, "projects", "host", "org", "repo");
+		mkdirSync(project, { recursive: true });
+		writeFileSync(join(project, "b.md"), "---\nname: b\ndescription: d\n---\n");
+		assert.deepEqual(findSopConflicts(dir), []);
+	});
 });

@@ -45,7 +45,14 @@ export interface ProbeResult {
 	commitCount: number;
 	hasManifest: boolean;
 	hasSopDir: boolean;
-	/** Number of `sop/*.md` files. */
+	/**
+	 * True when `projects/` exists. Optional structure: a library that only
+	 * carries project-scoped SOPs is still a valid library (design: `projects/`
+	 * was added after v1, so old libraries without it must keep probing as
+	 * ready — and a library that only has it must not probe as malformed).
+	 */
+	hasProjectsDir: boolean;
+	/** Number of `sop/*.md` files (global scope only; see `scanSopDir`). */
 	sopCount: number;
 }
 
@@ -190,6 +197,29 @@ function readOriginUrl(gitDir: string, configContent: string | null): string | n
 	}
 }
 
+/**
+ * Read `remote.origin.url` for a git dir straight from its config file.
+ *
+ * Pure fs, never spawns: the project-key resolver (lib/project.ts) walks the
+ * filesystem on `resources_discover` / `sop_save`, where shelling out to git
+ * would be an unaffordable cost. Returns null when the config is missing or has
+ * no origin (including the exotic `include` case, which we cannot follow here).
+ */
+export function readOriginUrlFromGitDir(gitDir: string): string | null {
+	let content: string;
+	try {
+		content = readFileSync(join(gitDir, "config"), "utf8");
+	} catch {
+		return null;
+	}
+	const values = parseGitConfig(content);
+	return (
+		configValue(values, "remote", "origin", "url") ??
+		configValue(values, "remote", "origin", "pushurl") ??
+		null
+	);
+}
+
 /** True when `ref` exists as a loose ref or inside `packed-refs`. */
 function refExists(gitDir: string, ref: string): boolean {
 	const common = resolveCommonGitDir(gitDir);
@@ -250,6 +280,7 @@ export function probeLibrary(dir: string): ProbeResult {
 		commitCount: 0,
 		hasManifest: false,
 		hasSopDir: false,
+		hasProjectsDir: false,
 		sopCount: 0,
 	};
 
@@ -273,6 +304,7 @@ export function probeLibrary(dir: string): ProbeResult {
 			state: "not-a-repo",
 			hasManifest,
 			hasSopDir,
+			hasProjectsDir: isDirectory(join(absolute, "projects")),
 			sopCount: listSopFiles(absolute).length,
 		};
 	}
@@ -296,12 +328,15 @@ export function probeLibrary(dir: string): ProbeResult {
 		hasManifest = false;
 	}
 	const hasSopDir = isDirectory(join(absolute, "sop"));
+	const hasProjectsDir = isDirectory(join(absolute, "projects"));
 	const sopFiles = listSopFiles(absolute);
 
 	// Structure first, then remote: a repo that has no remote AND no library
 	// skeleton is malformed, not "local-only usable" — `no-remote` means
 	// "a valid library that just lacks a remote" (design §1.3).
-	const structure = hasManifest || hasSopDir ? "ready" : "malformed";
+	// `projects/` counts as structure for the same reason `sop/` does: it is a
+	// legal (optional) part of the library layout.
+	const structure = hasManifest || hasSopDir || hasProjectsDir ? "ready" : "malformed";
 	if (!remote) {
 		return {
 			...base,
@@ -313,6 +348,7 @@ export function probeLibrary(dir: string): ProbeResult {
 			commitCount,
 			hasManifest,
 			hasSopDir,
+			hasProjectsDir,
 			sopCount: sopFiles.length,
 		};
 	}
@@ -327,6 +363,7 @@ export function probeLibrary(dir: string): ProbeResult {
 		commitCount,
 		hasManifest,
 		hasSopDir,
+		hasProjectsDir,
 		sopCount: sopFiles.length,
 	};
 }

@@ -13,8 +13,10 @@
  * files without it.
  */
 
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+
+import { PROJECTS_DIR } from "./project.ts";
 
 export interface SopFrontmatter {
 	name: string;
@@ -28,6 +30,13 @@ export interface SopDoc extends SopFrontmatter {
 	filePath: string;
 	/** File name without the `.md` extension. */
 	slug: string;
+	/**
+	 * `global` for `sop/*.md`, otherwise the project key of the containing
+	 * directory (`projects/<key>/…` → `<key>`, e.g.
+	 * `git.woa.com/csig_tdmq/tdmq-appserver`). Surfaced in MANIFEST and
+	 * `/sop <keyword>` so a reader can tell which project a SOP belongs to.
+	 */
+	scope: string;
 	body: string;
 }
 
@@ -41,8 +50,97 @@ export interface ScanResult {
 	issues: ParseIssue[];
 }
 
+/** Every SOP that lives outside a project directory belongs to this scope. */
+export const GLOBAL_SCOPE = "global";
+
+/** A SOP file and the scope it lives in. */
+export interface ScopedFile {
+	path: string;
+	scope: string;
+}
+
+/** A `.md` file present in more than one scope (name collision). */
+export interface ScopeConflict {
+	name: string;
+	/** `{ scope, filePath }` for every occurrence, global first. */
+	occurrences: { scope: string; filePath: string }[];
+}
+
 /** A valid skill name per the Agent Skills spec (and what pi warns about). */
 const NAME_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+/** Direct `*.md` children of `dir`, sorted; `[]` when unreadable. */
+function listMarkdown(dir: string): string[] {
+	try {
+		return readdirSync(dir, { withFileTypes: true })
+			.filter((entry) => entry.isFile() && entry.name.endsWith(".md") && !entry.name.startsWith("."))
+			.map((entry) => entry.name)
+			.sort();
+	} catch {
+		return [];
+	}
+}
+
+/**
+/**
+ * Every SOP file in the library: global first, then project-scoped.
+ *
+ * Reads are whole-library on purpose. Loading is deliberately narrow (only the
+ * current project's dir + the global dir are registered as skill paths), but
+ * search, MANIFEST and the duplicate guard must see every scope.
+ */
+export function listSopFiles(libDir: string): ScopedFile[] {
+	const files: ScopedFile[] = listMarkdown(join(libDir, "sop")).map((name) => ({
+		path: join(libDir, "sop", name),
+		scope: GLOBAL_SCOPE,
+	}));
+
+	const projectsDir = join(libDir, PROJECTS_DIR);
+	for (const relative of walkProjectFiles(projectsDir)) {
+		// The scope is the containing directory path — that IS the project key,
+		// because keys keep their `/` (host/org/repo). A file dumped directly
+		// into `projects/` has no key; it is skipped rather than guessed at.
+		const slash = relative.lastIndexOf("/");
+		if (slash <= 0) continue;
+		files.push({ path: join(projectsDir, relative), scope: relative.slice(0, slash) });
+	}
+	return files;
+}
+
+/** Depth-bounded walk of `projects/`, returning posix relative file paths. */
+function walkProjectFiles(root: string, prefix = "", depth = 0): string[] {
+	if (depth > 8) return []; // defensive: a pathological tree must not hang us
+	const current = prefix ? join(root, prefix) : root;
+	let entries;
+	try {
+		entries = readdirSync(current, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	const found: string[] = [];
+	for (const entry of entries) {
+		if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+		const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+		const absolute = join(root, relative);
+		let isDirectory = entry.isDirectory();
+		let isFile = entry.isFile();
+		if (entry.isSymbolicLink()) {
+			try {
+				const stat = statSync(absolute);
+				isDirectory = stat.isDirectory();
+				isFile = stat.isFile();
+			} catch {
+				continue; // broken symlink
+			}
+		}
+		if (isDirectory) {
+			found.push(...walkProjectFiles(root, relative, depth + 1));
+		} else if (isFile && entry.name.endsWith(".md")) {
+			found.push(relative);
+		}
+	}
+	return found.sort();
+}
 
 export function isValidSopName(name: string): boolean {
 	return name.length > 0 && name.length <= 64 && NAME_PATTERN.test(name);
@@ -145,8 +243,11 @@ export function renderSop(doc: {
 	].join("\n");
 }
 
-/** Read one SOP file. Returns null when the file has no usable frontmatter. */
-export function readSopFile(filePath: string): { doc: SopDoc } | { issue: ParseIssue } {
+/**
+ * Read one SOP file. Returns an issue when the file has no usable
+ * frontmatter. `scope` defaults to global so single-file callers stay simple.
+ */
+export function readSopFile(filePath: string, scope: string = GLOBAL_SCOPE): { doc: SopDoc } | { issue: ParseIssue } {
 	let content: string;
 	try {
 		content = readFileSync(filePath, "utf8");
@@ -163,36 +264,79 @@ export function readSopFile(filePath: string): { doc: SopDoc } | { issue: ParseI
 			...frontmatter,
 			filePath,
 			slug,
+			scope,
 			body: splitFrontmatter(content).body,
 		},
 	};
 }
 
-/** Scan `<libDir>/sop/*.md`. Never throws; unreadable files become issues. */
+/**
+ * Scan the whole library: `<libDir>/sop/*.md` plus every project directory
+ * under `<libDir>/projects/`. Never throws; unreadable files become issues.
+ *
+ * This is the read path (status / MANIFEST / search / duplicate guard) and is
+ * intentionally wider than the *load* path in `resources_discover`, which only
+ * registers the current project's directory and the global one.
+ */
 export function scanSopDir(libDir: string): ScanResult {
-	const sopDir = join(libDir, "sop");
-	let entries: string[];
-	try {
-		entries = readdirSync(sopDir, { withFileTypes: true })
-			.filter((entry) => entry.isFile() && entry.name.endsWith(".md") && !entry.name.startsWith("."))
-			.map((entry) => entry.name)
-			.sort();
-	} catch {
-		return { docs: [], issues: [] };
-	}
 	const docs: SopDoc[] = [];
 	const issues: ParseIssue[] = [];
-	for (const name of entries) {
-		const result = readSopFile(join(sopDir, name));
+	for (const file of listSopFiles(libDir)) {
+		const result = readSopFile(file.path, file.scope);
 		if ("doc" in result) docs.push(result.doc);
 		else issues.push(result.issue);
 	}
 	return { docs, issues };
 }
 
+/**
+ * Frontmatter `name` values that appear in more than one file.
+ *
+ * pi's skill loader keeps the first registration and silently drops the rest
+ * (`collision` diagnostic only), so a duplicate name means one SOP quietly
+ * disappears. `sop_save` refuses such writes up front; this detector covers the
+ * files a human added by hand.
+ */
+export function findSopConflicts(libDir: string): ScopeConflict[] {
+	const { docs } = scanSopDir(libDir);
+	const byName = new Map<string, { scope: string; filePath: string }[]>();
+	for (const doc of docs) {
+		const entries = byName.get(doc.name) ?? [];
+		// Global first inside each group, so the report reads as "the global one
+		// wins" (registration order is project-then-global).
+		entries.push({ scope: doc.scope, filePath: doc.filePath });
+		byName.set(doc.name, entries);
+	}
+	const conflicts: ScopeConflict[] = [];
+	for (const [name, occurrences] of byName) {
+		if (occurrences.length < 2) continue;
+		conflicts.push({ name, occurrences });
+	}
+	return conflicts.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** The slug (frontmatter name) already used by any file in the library. */
+export function findNameConflict(libDir: string, name: string): SopDoc | null {
+	for (const doc of scanSopDir(libDir).docs) {
+		if (doc.name === name) return doc;
+	}
+	return null;
+}
+
 /** Escape a value for a Markdown table cell. */
 function cell(value: string): string {
 	return value.replace(/\|/g, "\\|").replace(/\r?\n/g, " ").trim();
+}
+
+/**
+ * The description part to show in MANIFEST: for a bilingual
+ * `English | 中文` description only the English segment is shown, otherwise a
+ * long bilingual string would blow up the table width.
+ */
+export function descriptionHead(description: string): string {
+	const [head] = description.split("|");
+	// Fall back to the whole value when the head segment is empty (`| 中文`).
+	return (head?.trim() || description.trim()).replace(/\r?\n/g, " ");
 }
 
 /** Render MANIFEST.md from the scanned SOPs (deterministic ordering). */
@@ -202,24 +346,25 @@ export function renderManifest(docs: SopDoc[], generatedAt: string = new Date().
 		"# SOP MANIFEST",
 		"",
 		"> 本文件由 pi-sop 自动维护（`sop_save` 写入，`/sop init` → 状态面板 → 重建 MANIFEST 可强制刷新）。",
+		"> `scope` 列：`global` 或项目键（`git.woa.com/org/repo`），项目键对应 `projects/<键>/` 目录。",
 		`> 最后生成: ${generatedAt}`,
 		"",
-		"| name | description | triggers | last_verified |",
-		"|---|---|---|---|",
+		"| name | scope | description | triggers | last_verified |",
+		"|---|---|---|---|---|",
 	];
 	for (const doc of sorted) {
 		lines.push(
-			`| ${cell(doc.name)} | ${cell(doc.description)} | ${cell(doc.triggers)} | ${cell(doc.lastVerified)} |`,
+			`| ${cell(doc.name)} | ${cell(doc.scope)} | ${cell(descriptionHead(doc.description))} | ${cell(doc.triggers)} | ${cell(doc.lastVerified)} |`,
 		);
 	}
 	if (sorted.length === 0) {
-		lines.push("| _(empty)_ | | | |");
+		lines.push("| _(empty)_ | | | | |");
 	}
 	lines.push("");
 	return lines.join("\n");
 }
 
-/** Rebuild `<libDir>/MANIFEST.md` from `sop/*.md`. Returns the SOP count. */
+/** Rebuild `<libDir>/MANIFEST.md` from the whole library. Returns the count. */
 export function rebuildManifest(
 	libDir: string,
 	generatedAt?: string,
@@ -229,15 +374,9 @@ export function rebuildManifest(
 	return { count: docs.length, issues, content };
 }
 
-/** Count SOPs without parsing frontmatter (cheap path for notify text). */
+/** Count SOPs across all scopes (cheap path for notify text). */
 export function countSops(libDir: string): number {
-	try {
-		return readdirSync(join(libDir, "sop"), { withFileTypes: true }).filter(
-			(entry) => entry.isFile() && entry.name.endsWith(".md") && !entry.name.startsWith("."),
-		).length;
-	} catch {
-		return 0;
-	}
+	return listSopFiles(libDir).length;
 }
 
 /** Most recent `last_verified` across the library (status panel). */
