@@ -1,0 +1,32 @@
+{
+  "name": "pi-sop",
+  "version": "0.1.0",
+  "description": "SOP library for pi coding agents — git-synced, machine-shared, agent-discoverable. Cross-machine SOP/knowledge base that turns agent workflows into reusable, auto-loaded skills.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi",
+    "sop",
+    "procedure",
+    "playbook",
+    "memory",
+    "git",
+    "sync",
+    "skills",
+    "coding-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/zzjcool/pi-sop.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "files": [
+    "src",
+    "README.md"
+  ]
+}
