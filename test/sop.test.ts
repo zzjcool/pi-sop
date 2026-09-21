@@ -14,7 +14,7 @@ import { test } from "node:test";
 import {
 	countSops,
 	descriptionHead,
-	findNameConflict,
+	findNameConflicts,
 	findSopConflicts,
 	GLOBAL_SCOPE,
 	isValidSopName,
@@ -380,9 +380,12 @@ test("findSopConflicts reports a name present in two scopes, with both paths", (
 			["global", "host/org/repo"],
 		);
 		// the guard consults the same data
-		assert.equal(findNameConflict(dir, "shared")?.scope, "global");
-		assert.equal(findNameConflict(dir, "unique")?.scope, "global");
-		assert.equal(findNameConflict(dir, "absent"), null);
+		assert.deepEqual(findNameConflicts(dir, "shared").map((doc) => doc.scope), [
+			"global",
+			"host/org/repo",
+		]);
+		assert.equal(findNameConflicts(dir, "unique").length, 1);
+		assert.deepEqual(findNameConflicts(dir, "absent"), []);
 	});
 });
 

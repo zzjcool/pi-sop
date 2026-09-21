@@ -41,7 +41,7 @@ import {
 	today,
 } from "./lib/scaffold.ts";
 import {
-	findNameConflict,
+	findNameConflicts,
 	findSopConflicts,
 	GLOBAL_SCOPE,
 	countSops,
@@ -405,10 +405,10 @@ async function saveSop(params: SaveParams, cwd?: string): Promise<ToolText> {
 
 	// Duplicate-name guard. pi keeps the FIRST skill registered under a name and
 	// silently drops the rest (verified behavior), so a second file with the same
-	// frontmatter name is a silent loss, not a harmless copy. Refuse instead.
-	// Rewriting the *same* file is obviously allowed.
-	const clash = findNameConflict(dir, slug);
-	if (clash && resolve(clash.filePath) !== sopPath) {
+	// frontmatter name is a silent loss, not a harmless copy. Refuse instead —
+	// but rewriting the very same file is the normal update path.
+	const clash = findNameConflicts(dir, slug).find((doc) => !samePath(doc.filePath, sopPath));
+	if (clash) {
 		// Suggest a prefix taken from the OTHER scope's project name — that is the
 		// distinction the two files actually encode.
 		const otherKey = clash.scope === GLOBAL_SCOPE ? scope : clash.scope;
@@ -643,6 +643,16 @@ function canonical(path: string): string {
 	} catch {
 		return resolve(path);
 	}
+}
+
+/**
+ * True when two paths denote the same file. Compares canonical forms because
+ * `sop_save` builds its target through `projectDir` (realpath) while the scan
+ * yields lexical paths — under a symlinked library a naive string compare would
+ * reject an in-place update as a name conflict.
+ */
+function samePath(a: string, b: string): boolean {
+	return resolve(a) === resolve(b) || canonical(a) === canonical(b);
 }
 
 /** Commands have no access to `pi` here; keep the notify fallback simple. */

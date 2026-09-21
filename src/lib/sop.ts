@@ -315,12 +315,13 @@ export function findSopConflicts(libDir: string): ScopeConflict[] {
 	return conflicts.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-/** The slug (frontmatter name) already used by any file in the library. */
-export function findNameConflict(libDir: string, name: string): SopDoc | null {
-	for (const doc of scanSopDir(libDir).docs) {
-		if (doc.name === name) return doc;
-	}
-	return null;
+/**
+ * Every SOP file whose frontmatter `name` equals `name` (usually 0 or 1).
+ * More than one means the library already has a collision — which is exactly
+ * what `sop_save`'s guard and the session_start warning need to know.
+ */
+export function findNameConflicts(libDir: string, name: string): SopDoc[] {
+	return scanSopDir(libDir).docs.filter((doc) => doc.name === name);
 }
 
 /** Escape a value for a Markdown table cell. */
