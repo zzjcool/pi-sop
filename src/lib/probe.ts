@@ -262,12 +262,17 @@ export function probeLibrary(dir: string): ProbeResult {
 	const hasSopDir = isDirectory(join(absolute, "sop"));
 	const sopFiles = listSopFiles(absolute);
 
+	// Structure first, then remote: a repo that has no remote AND no library
+	// skeleton is malformed, not "local-only usable" — `no-remote` means
+	// "a valid library that just lacks a remote" (design §1.3).
+	const structure = hasManifest || hasSopDir ? "ready" : "malformed";
 	if (!remote) {
 		return {
 			...base,
-			state: "no-remote",
+			state: structure === "ready" ? "no-remote" : "malformed",
 			isRepo: true,
 			gitDir,
+			remote,
 			branch,
 			commitCount,
 			hasManifest,
@@ -278,7 +283,7 @@ export function probeLibrary(dir: string): ProbeResult {
 
 	return {
 		...base,
-		state: hasManifest || hasSopDir ? "ready" : "malformed",
+		state: structure,
 		isRepo: true,
 		gitDir,
 		remote,

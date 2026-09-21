@@ -142,12 +142,25 @@ test("malformed: git repo with origin but no SOP structure", () => {
 	});
 });
 
-test("no-remote takes precedence over malformed (local-only is still usable)", () => {
+test("structure decides usable state; a bare repo without skeleton is malformed even without remote", () => {
 	withDir((dir) => {
 		git(dir, ["init", "-b", "main"]);
 		writeFileSync(join(dir, "README.md"), "empty repo");
 		const result = probeLibrary(dir);
-		assert.equal(result.state, "no-remote");
+		// No MANIFEST and no sop/ → malformed. `no-remote` is reserved for a
+		// valid library that just lacks a remote (design §1.3), not a blanket
+		// pass for any remote-less repo — otherwise linkFlow/sop_save would
+		// happily write into a non-library repo.
+		assert.equal(result.state, "malformed");
+	});
+});
+
+test("a scaffolded library without remote probes as no-remote (still usable)", () => {
+	withDir((dir) => {
+		git(dir, ["init", "-b", "main"]);
+		writeFileSync(join(dir, "MANIFEST.md"), "| a |");
+		mkdirSync(join(dir, "sop"), { recursive: true });
+		assert.equal(probeLibrary(dir).state, "no-remote");
 	});
 });
 

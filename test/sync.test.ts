@@ -261,11 +261,30 @@ test("withLock runs the body and releases the lock", async () => {
 
 test("withLock reports acquired: false when another holder owns the lock", async () => {
 	const root = mkdtempSync(join(tmpdir(), "pi-sop-lock2-"));
-	const holder = spawn("flock", [join(root, "l.lock"), "sleep", "10"], { stdio: "ignore" });
+	const lockPath = join(root, "l.lock");
+	// Deterministic handshake instead of a fixed sleep: the holder prints a
+	// marker once it owns the lock, mirroring acquireLock's own detection.
+	const holder = spawn("flock", [lockPath, "-c", 'echo HELD; sleep 10'], {
+		stdio: ["ignore", "pipe", "ignore"],
+	});
 	try {
-		// Wait until the holder has actually taken the lock (plus margin).
-		await new Promise((resolveWait) => setTimeout(resolveWait, 400));
-		const result = await withLock(join(root, "l.lock"), async () => "should not run");
+		const held = await new Promise<boolean>((resolveHeld) => {
+			let buffer = "";
+			const timer = setTimeout(() => resolveHeld(false), 5000);
+			holder.stdout?.on("data", (chunk: Buffer) => {
+				buffer += String(chunk);
+				if (buffer.includes("HELD")) {
+					clearTimeout(timer);
+					resolveHeld(true);
+				}
+			});
+			holder.on("exit", () => {
+				clearTimeout(timer);
+				resolveHeld(false);
+			});
+		});
+		assert.equal(held, true, "holder must confirm lock ownership before we probe");
+		const result = await withLock(lockPath, async () => "should not run");
 		assert.equal(result.acquired, false);
 	} finally {
 		holder.kill("SIGKILL");

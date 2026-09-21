@@ -142,8 +142,9 @@ test("assertCreatable refuses an existing populated SOP library (use --link)", (
 // zero coverage of the ctx.ui.select/confirm/input decision paths).
 // ---------------------------------------------------------------------------
 
-import { runInit as _runInit } from "../src/commands/init.ts";
+import { runInit as _runInit, cloneFlow, linkFlow } from "../src/commands/init.ts";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createSandbox } from "./helpers.ts";
 
 interface ScriptedCtx {
@@ -258,4 +259,57 @@ test("wizard: not-a-repo confirm-yes scaffolds and finishes with reload", async 
 	} finally {
 		sandbox.cleanup();
 	}
+});
+
+// ---------------------------------------------------------------------------
+// Review round 2: retry-limit pin, linkFlow malformed guard, remote error text
+// ---------------------------------------------------------------------------
+
+test("cloneFlow non-interactive: unreachable remote throws immediately (no retry loop)", async () => {
+	const sandbox = createSandbox("pi-sop-clone-nonint-");
+	process.env.PI_SOP_DIR = join(sandbox.root, "lib");
+	try {
+		const ctx = scriptedCtx({ mode: "print" });
+		ctx.hasUI = false;
+		await assert.rejects(
+			cloneFlow("git@127.0.0.1:1/definitely/unreachable.git", ctx as never),
+			/远端不可用|不可达|unreachable|失败|无法/,
+		);
+	} finally {
+		sandbox.cleanup();
+	}
+});
+
+test("linkFlow non-interactive: malformed repo must fail loudly, never silently scaffold", async () => {
+	const sandbox = createSandbox("pi-sop-link-malformed-");
+	const libDir = join(sandbox.root, "lib");
+	process.env.PI_SOP_DIR = join(sandbox.root, "elsewhere");
+	// Build a repo that has commits but no MANIFEST.md and no sop/ dir.
+	mkdirSync(libDir, { recursive: true });
+	execFileSync("git", ["init", "-q", "-b", "main"], { cwd: libDir });
+	writeFileSync(join(libDir, "some-file.txt"), "existing content\n");
+	execFileSync("git", ["add", "some-file.txt"], { cwd: libDir });
+	execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"], { cwd: libDir });
+	try {
+		const ctx = scriptedCtx({ mode: "print" });
+		ctx.hasUI = false;
+		await assert.rejects(
+			linkFlow(libDir, ctx as never, { interactive: false }),
+			/缺少 SOP 库结构/,
+		);
+		// The user's file must be untouched, no scaffold committed.
+		assert.ok(existsSync(join(libDir, "some-file.txt")));
+		assert.equal(existsSync(join(libDir, "MANIFEST.md")), false);
+	} finally {
+		sandbox.cleanup();
+	}
+});
+
+test("summarizeRemoteError: SSH / auth / missing-repo families are distinguishable", async () => {
+	const { summarizeRemoteError } = await import("../src/lib/remote.ts");
+	const mk = (stderr: string) =>
+		({ ok: false, code: 128, stdout: "", stderr, timedOut: false, command: "" }) as never;
+	assert.match(String(summarizeRemoteError("git@github.com:you/lib.git", mk("Permission denied (publickey)"))), /SSH|密钥/);
+	assert.match(String(summarizeRemoteError("https://github.com/you/lib.git", mk("Authentication failed for 'https://github.com/you/lib.git'"))), /凭证|认证|凭据/);
+	assert.match(String(summarizeRemoteError("https://github.com/you/lib.git", mk("Repository not found."))), /不存在|not found|仓库/);
 });

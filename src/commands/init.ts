@@ -492,10 +492,13 @@ export async function linkFlow(
 			await finish(dir, ctx, { interactive: options.interactive });
 			return;
 		case "malformed": {
+			// Design §3.5: in non-interactive mode an exception that needs a
+			// decision must fail loudly, never guess. Scaffolding into someone's
+			// existing repo unasked is exactly such a decision.
 			if (!options.interactive) {
-				await scaffoldLibrary(dir, { init: false, commit: true, now: new Date() });
-				await finish(dir, ctx, { interactive: false });
-				return;
+				throw new Error(
+					`目录已是 git 仓库但缺少 SOP 库结构（无 MANIFEST.md 也无 sop/）：${dir}。交互模式下运行 /sop init 可补齐骨架`,
+				);
 			}
 			const repair = await ctx.ui.confirm("缺少 SOP 库结构", `${dir}\n\n补齐骨架文件？（不会覆盖已有文件）`);
 			if (!repair) {
