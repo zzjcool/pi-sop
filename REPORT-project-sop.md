@@ -3,7 +3,10 @@
 分支：`pi-subagent/worker-1-c0ad8f7e`（已推送）
 工作区：`/root/code/pi-sop/.pi-subagents/runs/r-a96cf281/worktrees/worker-1`
 Base：`dea98cf chore: prepare for npm publish`（未改动的 `main`）
-提交：`54c19b9 feat: project-scoped SOP mapping + multi-language conventions`、`41be2b0 fix: canonical path comparison in the duplicate guard, findNameConflicts`
+提交（本分支，按时间顺序）：
+- `64adcfa docs: add implementation report`
+- `069d7d0 feat: project-scoped SOP mapping + multi-language conventions`
+- `de96095 fix: canonical path comparison in the duplicate guard, findNameConflicts`
 
 ---
 
