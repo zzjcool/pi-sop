@@ -45,11 +45,11 @@ last_verified: 2026-09-21
 ## Install
 
 ```bash
-# from this repo
-pi install git:github.com/zzjcool/pi-sop
-
-# or after publishing
+# from npm
 pi install npm:pi-sop
+
+# or from git
+pi install git:github.com/zzjcool/pi-sop
 ```
 
 Then create your SOP library (once per machine):
@@ -70,7 +70,7 @@ git clone git@github.com:<you>/sop-library.git ~/sop-library
 
 - [x] Project scaffold
 - [x] Core extension (sync / skills / sop_save / /sop)
-- [ ] Multi-machine field test
+- [x] Multi-machine field test (rebase/conflict/autoInit flows verified end-to-end)
 - [ ] npm publish
 
 MIT © zzjcool
