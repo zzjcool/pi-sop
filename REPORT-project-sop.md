@@ -137,4 +137,6 @@ ok 189 - run() timeout kills a hanging child and reports timedOut
 1. **MR 需人工点击创建**（原因见 §6；与上一轮 worker-0 相同的环境限制）。
 2. **`last_verified` / 提示文案的 TUI 观感未手测**：`/sop status` 与 session_start 告警的多行 notify 只做了字符串级断言。
 3. **远程真实 origin（`git@git.woa.com:...`）不可达**：项目键解析全部基于本地 `.git/config` 的真实内容构造 fixture（含真实 `git submodule add` 产出的 `.git` 文件 + `.git/modules/<name>` 布局），未对真实远端做 `ls-remote`。
-4. **`$HOME` 下的仓库不参与项目键**（见偏差 1）：若用户把项目 clone 到 `~/repo`（直接在家目录下一级），该仓库会被识别；只有 `$HOME` 目录**本身**是仓库时才排除。
+4. **过程失误（已修复）**：首轮实现我误在**父 checkout**（`/root/code/pi-sop` 的 `main`）上编辑并提交，导致首批 commit 落在错误的 worktree。已通过 `git reset --hard dea98cf` 将父 checkout 恢复为原始 `main`（`git status` 干净、`src/lib/` 无 `project.ts`），并将两个工作 commit cherry-pick 到本分支（新 SHA `069d7d0` / `de96095`）。本分支后续所有验证均在 worktree 内执行。教训：命令不要带 `cd /root/code/pi-sop` 前缀。
+
+5. **`$HOME` 下的仓库不参与项目键**（见偏差 1）：若用户把项目 clone 到 `~/repo`（直接在家目录下一级），该仓库会被识别；只有 `$HOME` 目录**本身**是仓库时才排除。
