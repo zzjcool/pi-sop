@@ -406,3 +406,22 @@ test("commitAll commits when staged set matches paths", async () => {
 	assert.equal(result.committed, true);
 	rmSync(dir, { recursive: true, force: true });
 });
+
+test("run() timeout kills a hanging child and reports timedOut", async () => {
+	// After removing the manual timers, timedOut must be derived from
+	// execFile's error.killed alone. Drive `run` through the public `clone`
+	// helper with a command that provably hangs (sleep is not git, but the
+	// kill path is identical): use a local path remote whose helper blocks.
+	// Simplest deterministic probe: `git ls-remote` against a pipe that never
+	// answers — emulate with a fifo remote is overkill; instead call the
+	// internal behavior via a git command that waits on stdin: `git hash-object --stdin`
+	// with no input never returns until stdin closes... execFile gives it no
+	// stdin that closes, so it hangs. Timeout must kill it.
+	const dir = mkdtempSync(join(tmpdir(), "pi-sop-timeout-"));
+	const { execFile } = await import("node:child_process");
+	void execFile; // (sanity: node builtin available)
+	const result = await git(dir, ["hash-object", "--stdin"], 1000);
+	assert.equal(result.ok, false);
+	assert.equal(result.timedOut, true, "timeout must be reported as timedOut");
+	rmSync(dir, { recursive: true, force: true });
+});

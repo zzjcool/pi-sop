@@ -32,7 +32,14 @@ import {
 	type ProbeResult,
 } from "./lib/probe.ts";
 import { hasSkeleton, refreshManifest, scaffoldLibrary, today } from "./lib/scaffold.ts";
-import { countSops, renderManifest, renderSop, scanSopDir, slugifySopName } from "./lib/sop.ts";
+import {
+	countSops,
+	mostRecentVerification,
+	renderManifest,
+	renderSop,
+	scanSopDir,
+	slugifySopName,
+} from "./lib/sop.ts";
 import {
 	commitAll,
 	firstLine,
@@ -391,12 +398,8 @@ async function commandStatus(ctx: ExtensionCommandContext): Promise<void> {
 }
 
 function mostRecentlyVerified(dir: string): string | null {
-	const { docs } = scanSopDir(dir);
-	let best: { name: string; date: string } | null = null;
-	for (const doc of docs) {
-		if (!doc.lastVerified) continue;
-		if (!best || doc.lastVerified > best.date) best = { name: doc.name, date: doc.lastVerified };
-	}
+	// Same logic as the status panel — use the shared helper, not a twin copy.
+	const best = mostRecentVerification(scanSopDir(dir).docs);
 	return best ? `${best.name} (${best.date})` : null;
 }
 

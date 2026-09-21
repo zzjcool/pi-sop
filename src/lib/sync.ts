@@ -86,9 +86,10 @@ function gitEnv(): NodeJS.ProcessEnv {
 }
 
 function run(command: string, args: string[], options: { cwd?: string; timeout: number }): Promise<GitResult> {
+	// execFile's own `timeout` + `killSignal: "SIGKILL"` is the single timeout
+	// mechanism: Node kills the child and reports error.killed === true.
 	return new Promise((resolvePromise) => {
-		let timedOut = false;
-		const child = execFile(
+		execFile(
 			command,
 			args,
 			{
@@ -107,23 +108,11 @@ function run(command: string, args: string[], options: { cwd?: string; timeout: 
 					code: error ? (typeof exitError?.code === "number" ? exitError.code : null) : 0,
 					stdout: stdout ?? "",
 					stderr: stderr ?? "",
-					timedOut,
+					timedOut: exitError?.killed === true,
 					command: `${command} ${args.join(" ")}`,
 				});
 			},
 		);
-		if (child.killed) timedOut = true;
-		const timer = setTimeout(() => {
-			timedOut = true;
-			try {
-				child.kill("SIGKILL");
-			} catch {
-				/* already gone */
-			}
-		}, options.timeout);
-		child.on("exit", () => clearTimeout(timer));
-		child.on("error", () => clearTimeout(timer));
-		setTimeout(() => clearTimeout(timer), options.timeout + 1000).unref?.();
 	});
 }
 
@@ -340,8 +329,8 @@ export async function syncLibrary(
 	lastAttempt.set(key, now);
 	const result = await pullLibrary(dir, null);
 	if (result.verdict === "failed" || result.verdict === "locked") {
-		// Do not hammer the network on a broken remote: keep the throttle window.
-		lastAttempt.set(key, now);
+		// The attempt timestamp set above already keeps the throttle window —
+		// no need to touch it again (the old second set was a same-value no-op).
 		return result;
 	}
 	// Design §5: sync is pull AND push — without the push leg, local commits
