@@ -300,3 +300,20 @@ pi 启动看是否都被识别为 skill
 7. 风险点验证（§6 末尾）插在 5 之前做，决定 `sop_save` 的文件布局
 
 配套：tsconfig + `tsc --noEmit` typecheck、极小单元测试（probe/scaffold），向导用 `-e` 手测清单。
+
+---
+
+## 附录 B：项目专属 SOP 映射 + 多语言约定（第二轮扩展设计，已实现）
+
+核心机制（均经实测验证）：
+- 项目键 = 归一化 origin URL（ssh/https/大小写/.git 后缀 5 变体同键），目录形式 `projects/<host>/<org>/<repo>/`
+- `resolveProjectKeys`：从 cwd **向上遍历**找 .git（修「子目录启动失联」）；submodule `.git` 文件产生父子双键
+- `resources_discover` 注入 `[项目目录…, sop/]`，项目在前（实测 skill 同名先注册者胜出，故配套重名守卫）
+- `sop_save` 新增 `project: true` 参数（默认全局，防误归类）；写入前全库重名检查，冲突拒绝并建议改名
+- 多语言：正文单语随作者、triggers 中英混塞、description 可选 `英文 | 中文`（MANIFEST 取前段）
+
+已认可的实现偏差（7 条，详见 worker 报告第 5 节）：$HOME 本身是仓库时不参与项目键；file:// 本地路径 origin 退化为全局；只有 projects/ 的库判 ready（非 malformed）；重名守卫用 canonical path 比较（symlink 安全）；冲突告警覆盖 no-remote 态；descriptionHead 空段回退全文；aliases.json 留 TODO。
+
+已知边界（记录在案，非缺陷）：
+1. 非 git 目录的库（手工搭建未经 /sop init）不服务 skill——probe 状态机要求 repo，这是刻意的（库必须可同步）
+2. skill 同名时 pi 静默先注册者胜出——pi-sop 以「写入前拒绝」防御，但用户手写文件可绕过，故 session_start 有冲突扫描告警
