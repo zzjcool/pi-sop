@@ -69,7 +69,7 @@ git clone git@github.com:<you>/sop-library.git ~/sop-library
 ## Status
 
 - [x] Project scaffold
-- [ ] Core extension (sync / skills / sop_save / /sop)
+- [x] Core extension (sync / skills / sop_save / /sop)
 - [ ] Multi-machine field test
 - [ ] npm publish
 
