@@ -71,6 +71,6 @@ git clone git@github.com:<you>/sop-library.git ~/sop-library
 - [x] Project scaffold
 - [x] Core extension (sync / skills / sop_save / /sop)
 - [x] Multi-machine field test (rebase/conflict/autoInit flows verified end-to-end)
-- [ ] npm publish
+- [x] npm publish
 
 MIT © zzjcool
