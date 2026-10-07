@@ -235,10 +235,17 @@ syncLibrary():
   state != ready-ish → skip
   进程内节流：距上次同步 <10min → skip（防 /resume /fork 重复拉）
   flock <libDir>/.git/pi-sop.lock（非阻塞抢锁，抢不到 → 别的进程在同步，skip）
+  【发现遗留 rebase/merge 卡住（上次同步冲突未解决）→ 先自动解决（见下方自动策略）】
   git pull --rebase --autostash（timeout 8s）
-    成功 → 更新 config.lastSyncAt
-    冲突 → notify("pi-sop: 同步冲突，已保留本地，运行 /sop init 查看")
-           终不 force / 不 reset，冲突留给状态面板的人工出口
+    成功 → 更新 config.lastSyncAt；有远端则随后 push（把本地提交补上去）
+    冲突 → 自动解决策略（v0.3）：
+      sop/**、projects/** 内的冲突 → 取本地（rebase 中 --theirs = 被重放的本地提交）
+      MANIFEST.md 冲突 → 从盘上 SOP 文件重新生成（它是纯函数，文本冲突必然是噪声）
+      解决后 rebase --continue（GIT_EDITOR=true，空提交 → --skip）
+      多提交重放：循环逐个解决，直到 rebase 完成，最后重建一次 MANIFEST 并提交
+      自动成功 → 判为 ok（用户无感），随后照常 push
+    冲突涉及非 SOP 文件（README、手加文件等）→ 终不 force / 不 reset，
+      保留 rebase 现场并 notify（唯一需要人工的场景）
     超时/网络失败 → 静默降级（本地缓存照常服务 skill），仅 debug 日志
 ```text
 
@@ -285,7 +292,7 @@ pi 启动看是否都被识别为 skill
 | 启动时未初始化（每进程一次） | `pi-sop: SOP 库未初始化，运行 /sop init 开始` |
 | 初始化成功 | `SOP 库就绪：<path>（N 个 SOP，远端: <remote|本地模式>）` |
 | local-only 建库 | `已创建本地 SOP 库：<path>。运行 /sop init 可随时补充远端实现多机同步。` |
-| 同步冲突 | `pi-sop: 同步冲突，本地修改已保留。运行 /sop init → 状态面板处理` |
+| 同步冲突（非 SOP 文件，需人工） | `pi-sop: 同步冲突（非 SOP 文件），本地修改已保留。运行 /sop init → 状态面板处理` +\n原因（auto-resolve 放弃的详情） |
 | sop_save 推送失败 | `已本地提交；推送失败（<原因>），将在下次会话重试` |
 | 禁用后 sop_save | `pi-sop 已禁用，请用户运行 /sop init 重新启用` |
 

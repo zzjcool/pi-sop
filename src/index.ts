@@ -69,7 +69,7 @@ const NOTIFY = {
 	disabledSave: "pi-sop 已禁用，请用户运行 /sop init 重新启用",
 	notInitialized:
 		"SOP 库未初始化。请让用户运行 /sop init，或将 PI_SOP_DIR 指向已有库。",
-	conflict: "pi-sop: 同步冲突，本地修改已保留。运行 /sop init → 状态面板处理",
+	conflict: "pi-sop: 同步冲突（非 SOP 文件），本地修改已保留。运行 /sop init → 状态面板处理",
 } as const;
 
 /** Once-per-process flag: `resume`/`fork` must not re-notify. */
@@ -126,10 +126,15 @@ export default function piSop(pi: ExtensionAPI): void {
 		void syncLibrary(dir, { probe: { remote: probe.remote, branch: probe.branch } }).then(
 			(result) => {
 				if (result.verdict === "conflict") {
-					try {
-						ctx.ui.notify(NOTIFY.conflict, "warning");
+					// Auto-resolution covers SOP-area conflicts silently; a conflict
+				// verdict means non-SOP files are involved — a human must decide.
+				try {
+					ctx.ui.notify(
+						`${NOTIFY.conflict}${result.detail ? `\n原因: ${result.detail}` : ""}`,
+						"warning",
+					);
 					} catch {
-						// Stale ctx after reload/session switch — nothing to do.
+					// Stale ctx after reload/session switch — nothing to do.
 					}
 				}
 				if (result.verdict === "ok") {

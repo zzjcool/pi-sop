@@ -15,11 +15,12 @@
  */
 
 import { execFile, spawn } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { lockPathForDir, resolveGitDir } from "./probe.ts";
+import { lockPathForDir, resolveCommonGitDir, resolveGitDir } from "./probe.ts";
+import { rebuildManifest } from "./sop.ts";
 
 /** Timeouts (ms) — design §0: network ops stay in the 5–8s band. */
 export const TIMEOUTS = {
@@ -29,6 +30,9 @@ export const TIMEOUTS = {
 	clone: 30_000,
 	/** Local-only operations: no network, generous but finite. */
 	local: 15_000,
+	/** `rebase --continue`: local, but the 8s pull band is too tight for a
+	 * big library on a slow disk. */
+	continue: 15_000,
 } as const;
 
 /** In-process throttle window for the automatic session_start pull. */
@@ -137,6 +141,203 @@ export function looksLikeConflict(result: GitResult): boolean {
 	return /CONFLICT|conflict \(content\)|Automatic merge failed|cannot pull with rebase|would be overwritten by merge|needs merge/i.test(
 		blob,
 	);
+}
+
+/** One step of a rebase-resolution outcome, for reporting/telemetry. */
+export interface ConflictResolution {
+	/** True when the rebase was brought to completion (or nothing was pending). */
+	resolved: boolean;
+	/** Number of rebased local commits that needed resolution. */
+	steps: number;
+	/** Commit-sha of any local commit that was dropped for touching SOPs only. */
+	dropped?: string;
+	/** First error line when the automated resolution had to give up. */
+	detail?: string;
+}
+
+/**
+ * True when the git dir shows a merge/rebase/cherry-pick in progress.
+ *
+ * Uses the common git dir so linked worktrees are covered too. This is a
+ * pure-fs check, so `commitAll` can afford it on every call.
+ */
+export function rebaseInProgress(libDir: string): boolean {
+	const gitDir = resolveCommonGitDir(resolveGitDir(libDir) ?? join(libDir, ".git"));
+	return ["rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD"].some((marker) =>
+		existsSync(join(gitDir, marker)),
+	);
+}
+
+/**
+ * True when `path` lives inside the SOP library's content area
+ * (`sop/…` or `projects/…`, at any depth) — everything a machine is allowed
+ * to auto-resolve. Anything else (README, config, a file a human added at the
+ * root) is out of bounds: the automated resolver must not decide for it.
+ */
+export function isSopPath(relativePath: string): boolean {
+	const posix = relativePath.replace(/\\/g, "/");
+	return posix === "MANIFEST.md" || posix.startsWith("sop/") || posix.startsWith("projects/");
+}
+
+/** Unmerged (conflicted) paths, relative to the repo root, sorted. */
+async function unmergedPaths(dir: string): Promise<string[]> {
+	const result = await git(dir, ["diff", "--name-only", "--diff-filter=U"], TIMEOUTS.local);
+	if (!result.ok) return [];
+	return result.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).sort();
+}
+
+/**
+ * Finish a rebase that has all conflicts resolved and staged.
+ *
+ * `git rebase --continue` normally opens an editor to reword the message of the
+ * commit being replayed; `GIT_EDITOR=true` accepts the existing message so the
+ * flow never blocks on a prompt (the frozen "never prompt" rule). An
+ * "nothing to commit" failure means the replayed commit became empty after
+ * resolution (e.g. a MANIFEST-only rebuild whose remote counterpart won — the
+ * manifest is regenerated afterwards anyway); `--skip` drops it, which is
+ * exactly right: dropping content would lose SOPs, but an empty commit
+ * carries none.
+ */
+async function rebaseContinue(dir: string): Promise<GitResult> {
+	const env = { ...process.env, GIT_EDITOR: "true" };
+	// `run()` builds its own env; go through a one-off promise to inject ours.
+	const result = await new Promise<GitResult>((resolvePromise) => {
+		execFile(
+			"git",
+			["rebase", "--continue"],
+			{
+				cwd: dir,
+				timeout: TIMEOUTS.continue,
+				killSignal: "SIGKILL",
+				maxBuffer: 4 * 1024 * 1024,
+				encoding: "utf8",
+				env: { ...gitEnv(), ...env },
+				windowsHide: true,
+				},
+			(error, stdout, stderr) => {
+				const exitError = error as (Error & { code?: number | string; killed?: boolean }) | null;
+				resolvePromise({
+					ok: !error,
+					code: error ? (typeof exitError?.code === "number" ? exitError.code : null) : 0,
+					stdout: stdout ?? "",
+					stderr: stderr ?? "",
+					timedOut: exitError?.killed === true,
+					command: "git rebase --continue",
+				});
+			},
+		);
+	});
+	if (result.ok) return result;
+	if (/nothing to commit|no changes|did not receive any changes/i.test(`${result.stdout}\n${result.stderr}`)) {
+		return git(dir, ["rebase", "--skip"], TIMEOUTS.continue);
+	}
+	return result;
+}
+
+/**
+ * Resolve a stuck rebase/merge automatically (v0.3 fix).
+ *
+ * Policy, per file class (safe because the SOP library is a machine-managed
+ * repo — the only files with real authority are the SOP docs themselves):
+ *   1. SOP files (`sop/**`, `projects/**`): take the LOCAL side. In a
+ *      `pull --rebase`, "local" = the commits being replayed on top of the
+ *      remote; git's `--theirs` in a rebase is the commit being replayed, i.e.
+ *      the local machine's newest SOP content. Verified experimentally.
+ *   2. `MANIFEST.md`: regenerate from the on-disk SOP files after every step —
+ *      it is a pure function of the files, so any textual conflict in it is
+ *      noise, never information. This makes the whole class of "MANIFEST
+ *      conflicts" (the most common one) self-healing.
+ *   3. Anything else unmerged: out of bounds → resolved=false (human needed).
+ *
+ * The loop handles multi-commit replays: after each `--continue`, git stops
+ * again at the next conflicting commit. After the rebase finishes, the MANIFEST
+ * is rebuilt once more from the final file set and committed if it differs.
+ *
+ * Runs under the library lock when called from `pullLibrary` (caller holds it);
+ * standalone callers should wrap their own `withLock`.
+ */
+async function resolveRebase(dir: string): Promise<ConflictResolution> {
+	let steps = 0;
+	for (let guard = 0; guard < 50; guard++) {
+		// Loop until the rebase is finished (no marker dirs left) or we bail.
+		const conflicted = await unmergedPaths(dir);
+		if (conflicted.length > 0) {
+			// Out-of-bounds conflicts are a hard stop: never auto-decide files the
+			// extension does not own.
+			const foreign = conflicted.filter((p) => !isSopPath(p));
+			if (foreign.length > 0) {
+				return { resolved: false, steps, detail: `非 SOP 文件冲突，需人工处理: ${foreign.slice(0, 3).join(", ")}` };
+			}
+			// SOP files: --theirs == the local (replayed) side during rebase.
+			// A delete/modify conflict (UD: the local commit deleted the file,
+			// the remote modified it) has no "their version" to check out —
+			// the local intent was the deletion, so `git rm` is the resolution.
+			// DU (remote deleted, local modified) restores via --theirs as usual.
+			const sopFiles = conflicted.filter((p) => p !== "MANIFEST.md");
+			for (const path of sopFiles) {
+				const checkout = await git(dir, ["checkout", "--theirs", "--", path], TIMEOUTS.local);
+				if (checkout.ok) {
+					const add = await git(dir, ["add", "--", path], TIMEOUTS.local);
+					if (!add.ok) {
+						return { resolved: false, steps, detail: `git add 失败: ${firstLine(add.stderr)}` };
+					}
+					continue;
+				}
+				if (/does not have their version|no such path|exists on disk/i.test(checkout.stderr)) {
+					const remove = await git(dir, ["rm", "-q", "--", path], TIMEOUTS.local);
+					if (!remove.ok) {
+						return { resolved: false, steps, detail: `git rm 失败: ${firstLine(remove.stderr)}` };
+					}
+					continue;
+				}
+				return { resolved: false, steps, detail: `checkout --theirs 失败: ${firstLine(checkout.stderr)}` };
+			}
+			// MANIFEST (or any remaining sop-path conflict): regenerate from disk.
+			const manifestConflicts = conflicted.filter((p) => p === "MANIFEST.md");
+			if (manifestConflicts.length > 0) {
+				const { content } = rebuildManifest(dir, new Date().toISOString());
+				writeFileSync(join(dir, "MANIFEST.md"), content, "utf8");
+				await git(dir, ["add", "--", "MANIFEST.md"], TIMEOUTS.local);
+			}
+		}
+		// Nothing unmerged but a rebase marker still present: a stop without
+		// conflicts (rare) — continue anyway; if nothing to commit, skip.
+		const step = await rebaseContinue(dir);
+		steps++;
+		if (!step.ok && !rebaseInProgress(dir)) {
+			return { resolved: false, steps, detail: `rebase --continue 失败: ${firstLine(step.stderr || step.stdout)}` };
+		}
+		if (!rebaseInProgress(dir)) {
+			// Rebase finished: refresh MANIFEST from the final file set so the
+			// "local wins" SOP picks are reflected in the index too.
+			const { content } = rebuildManifest(dir, new Date().toISOString());
+			const manifestPath = join(dir, "MANIFEST.md");
+			const previous = readFileSyncSafe(manifestPath);
+			if (previous !== content) {
+				writeFileSync(manifestPath, content, "utf8");
+				await git(dir, ["add", "--", "MANIFEST.md"], TIMEOUTS.local);
+				const commit = await git(
+				dir,
+				["commit", "-m", "chore: auto-resolve MANIFEST after sync conflict", "--", "MANIFEST.md"],
+				TIMEOUTS.local,
+				);
+				if (!commit.ok) {
+				return { resolved: false, steps, detail: `MANIFEST 提交失败: ${firstLine(commit.stderr)}` };
+				}
+			}
+			return { resolved: true, steps };
+		}
+		// Else: the continue advanced to the next stop — loop again.
+	}
+	return { resolved: false, steps, detail: "rebase 步数超限（50），已停止自动处理" };
+}
+
+function readFileSyncSafe(path: string): string {
+	try {
+		return readFileSync(path, "utf8");
+	} catch {
+		return "";
+	}
 }
 
 /**
@@ -281,19 +482,40 @@ async function acquireInProcess(lockPath: string): Promise<LockHandle> {
  * with `cwd` inside a bare git dir. The lock is derived from the resolved git
  * dir so linked worktrees share one lock.
  *
- * Never forces, never resets. A conflict is surfaced (the human resolves it from
- * the status panel); network/timeout failures degrade silently.
+ * Never forces, never resets. A conflict inside the SOP area is resolved
+ * automatically (local SOPs win, MANIFEST regenerates); a conflict involving
+ * foreign files leaves the rebase in place and reports it. Network/timeout
+ * failures degrade silently.
  */
 export async function pullLibrary(dir: string): Promise<SyncResult> {
 	const lock = await withLock(lockPathForDir(dir), async () => {
+		// A previous sync may have died mid-rebase (conflicted pull, killed
+		// process). Nothing new can start until it is finished — resolve it
+		// first (v0.3 fix for "warning loop with no way out").
+		if (rebaseInProgress(dir)) {
+			const fix = await resolveRebase(dir);
+			if (!fix.resolved) {
+				return {
+					verdict: "conflict" as SyncVerdict,
+					message: "pi-sop: 检测到需人工处理的同步冲突（非 SOP 文件）。运行 /sop init → 状态面板处理",
+					detail: fix.detail,
+				};
+			}
+		}
 		const args = ["pull", "--rebase", "--autostash"];
 		const result = await git(dir, args, TIMEOUTS.pull);
 		if (result.ok) return { verdict: "ok" as SyncVerdict, message: "已同步" };
 		if (looksLikeConflict(result)) {
+			const fix = await resolveRebase(dir);
+			if (fix.resolved) {
+				// The pull's rebase completed via auto-resolution; a push is still
+				// needed to fast-forward the remote — syncLibrary drives it.
+				return { verdict: "ok" as SyncVerdict, message: "已同步（冲突已自动解决）" };
+			}
 			return {
 				verdict: "conflict" as SyncVerdict,
 				message: "pi-sop: 同步冲突，本地修改已保留。运行 /sop init → 状态面板处理",
-				detail: firstLine(result.stderr || result.stdout),
+				detail: fix.detail ?? firstLine(result.stderr || result.stdout),
 			};
 		}
 		return {

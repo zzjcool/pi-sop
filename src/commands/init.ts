@@ -50,6 +50,8 @@ import {
 	pushLibrary,
 	addRemote,
 	resetSyncThrottle,
+	rebaseInProgress,
+	syncLibrary,
 } from "../lib/sync.ts";
 
 /** ------------------------------------------------------------------ */
@@ -587,6 +589,27 @@ async function finish(dir: string, ctx: ExtensionCommandContext, _options: Finis
 
 /** `/sop init` on a usable library lands here (design §3.4). */
 async function statusPanel(probe: ProbeResult, ctx: ExtensionCommandContext): Promise<void> {
+	// A stuck rebase/merge (e.g. a conflicted sync that involved non-SOP files)
+	// blocks everything: pulls refuse to run, commits are refused. Since v0.3
+	// the automatic resolver handles SOP-area conflicts on its own, so a stuck
+	// state still present here means it needs a human — surface it up front.
+	if (probe.gitDir && rebaseInProgress(probe.dir)) {
+		const stuck = await git(probe.dir, ["status", "--porcelain"], 5000).catch(() => null);
+		const lines = [
+			"SOP 库存在未完成的 rebase/merge（同步冲突未解决），新的同步与保存被阻塞。",
+		];
+		if (stuck?.ok) {
+			const conflicted = stuck.stdout
+				.split(/\r?\n/)
+				.map((l) => l.trim())
+				.filter((l) => l.startsWith("UU") || l.startsWith("AA") || l.startsWith("DD"))
+				.map((l) => l.slice(3));
+			if (conflicted.length > 0) lines.push(`冲突文件：${conflicted.slice(0, 5).join(", ")}`);
+		}
+		lines.push("", "在库目录手动执行：解决冲突 → git add → git rebase --continue；或 git rebase --abort 放弃本地变基。", `库路径：${probe.dir}`);
+		ctx.ui.notify(lines.join("\n"), "warning");
+		return;
+	}
 	const actions = ["立即同步", "配置远端", "重建 MANIFEST", "退出"];
 	for (;;) {
 		const summary = await buildStatusLines(probe);
@@ -603,7 +626,13 @@ async function statusPanel(probe: ProbeResult, ctx: ExtensionCommandContext): Pr
 			if (!probe.gitDir) continue;
 			// An explicit user action overrides the session_start throttle.
 			resetSyncThrottle();
-			const result = await pullLibrary(probe.dir);
+			// Full sync (pull AND push): after an auto-resolved conflict the local
+			// branch is ahead of the remote — the push leg is what actually
+			// converges the other machines.
+			const result = await syncLibrary(probe.dir, {
+				force: true,
+				probe: { remote: probe.remote, branch: probe.branch },
+			});
 			ctx.ui.notify(result.message, result.verdict === "ok" ? "info" : "warning");
 			continue;
 		}
@@ -615,7 +644,7 @@ async function statusPanel(probe: ProbeResult, ctx: ExtensionCommandContext): Pr
 			const result = await refreshManifest(probe.dir, "chore: rebuild MANIFEST", new Date());
 			ctx.ui.notify(
 				result.changed
-					? `MANIFEST 已重建（${result.count} 个 SOP${result.committed ? "，已提交" : ""}）`
+				? `MANIFEST 已重建（${result.count} 个 SOP${result.committed ? "，已提交" : ""}）`
 					: `MANIFEST 已是最新（${result.count} 个 SOP）`,
 				"info",
 			);

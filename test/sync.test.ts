@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -20,6 +20,7 @@ import {
 	firstLine,
 	git,
 	initRepo,
+	isSopPath,
 	looksLikeConflict,
 	pullLibrary,
 	pushLibrary,
@@ -183,13 +184,13 @@ test("pullLibrary pulls a new commit from a real remote", async () => {
 	}, { remote: true });
 });
 
-test("pullLibrary surfaces a rebase conflict instead of forcing", async () => {
+test("pullLibrary auto-resolves a SOP conflict (local content wins, MANIFEST regenerated)", async () => {
 	await withRepo(async ({ dir, root }) => {
 		const remote = join(root, "remote.git");
 		await commitAll(dir, "init");
 		await git(dir, ["push", "--set-upstream", "origin", "main"]);
 
-		// Someone else commits a conflicting change to the same file.
+		// Someone else commits a conflicting change to the same files.
 		const other = join(root, "other");
 		gitSync(root, ["clone", remote, other]);
 		writeFileSync(join(other, "MANIFEST.md"), "remote wins\n");
@@ -203,20 +204,201 @@ test("pullLibrary surfaces a rebase conflict instead of forcing", async () => {
 		const localSha = (await git(dir, ["rev-parse", "HEAD"])).stdout.trim();
 
 		const result = await pullLibrary(dir);
-		assert.equal(result.verdict, "conflict");
+		assert.equal(result.verdict, "ok", `expected auto-resolution, got ${result.verdict} (${result.detail})`);
 
-		// Frozen rule: no force, no reset. The local commit must still exist and
-		// the rebase must be left in progress for the human to resolve.
-		const stillThere = await git(dir, ["cat-file", "-e", `${localSha}^{commit}`]);
-		assert.equal(stillThere.ok, true, "local commit must survive a conflicted pull");
-		const inProgress = existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply"));
-		assert.equal(inProgress, true, "rebase left in progress rather than being aborted");
-
-		// The lock file must live in .git, never in the worktree (nor be committed).
-		const status = await git(dir, ["status", "--porcelain"]);
-		assert.doesNotMatch(status.stdout, /pi-sop\.lock/);
-		assert.equal(lockPathForDir(dir), join(dir, ".git", "pi-sop.lock"));
+		// No force, no reset: the local commit still exists (replayed).
+		const log = await git(dir, ["log", "--pretty=%s"]);
+		assert.match(log.stdout, /local change/);
+		void localSha;
+		// The rebase is FINISHED — the v0.3 fix: no stuck state left behind.
+		assert.equal(
+			existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply")),
+			false,
+			"rebase must be completed by the auto-resolver",
+		);
+		// The worktree is clean of conflict markers in MANIFEST.
+		const manifest = readFileSync(join(dir, "MANIFEST.md"), "utf8");
+		assert.doesNotMatch(manifest, /<<<<<<<|>>>>>>>/);
+		// Remote got our resolved history (fast-forward push by syncLibrary is
+		// separate; here just verify the local branch is a superset of remote).
+		const remoteHead = gitSync(root, ["--git-dir", remote, "rev-parse", "main"]).trim();
+		const isAncestor = await git(dir, ["merge-base", "--is-ancestor", remoteHead, "main"]);
+		assert.equal(isAncestor.ok, true, "resolved history must contain the remote head");
 	}, { remote: true });
+});
+
+test("pullLibrary auto-resolves a multi-commit rebase, each step conflicting", async () => {
+	await withRepo(async ({ dir, root }) => {
+		const remote = join(root, "remote.git");
+		await commitAll(dir, "init");
+		await git(dir, ["push", "--set-upstream", "origin", "main"]);
+
+		const other = join(root, "other");
+		gitSync(root, ["clone", remote, other]);
+		writeFileSync(join(other, "MANIFEST.md"), "remote 1\n");
+		gitSync(other, ["add", "-A"]);
+		gitSync(other, ["commit", "-m", "remote change 1"]);
+		gitSync(other, ["push", "origin", "main"]);
+
+		// Two local commits, both conflicting on MANIFEST.md.
+		writeFileSync(join(dir, "MANIFEST.md"), "local 1\n");
+		await commitAll(dir, "local change 1");
+		writeFileSync(join(dir, "MANIFEST.md"), "local 2\n");
+		await commitAll(dir, "local change 2");
+
+		const result = await pullLibrary(dir);
+		assert.equal(result.verdict, "ok", `multi-step expected ok, got ${result.verdict} (${result.detail})`);
+		const log = await git(dir, ["log", "--pretty=%s"]);
+		assert.match(log.stdout, /local change 1/);
+		assert.match(log.stdout, /local change 2/);
+		assert.equal(
+			existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply")),
+			false,
+		);
+	}, { remote: true });
+});
+
+test("pullLibrary recovers a previously stuck rebase (pre-v0.3 bug shape)", async () => {
+	await withRepo(async ({ dir, root }) => {
+		const remote = join(root, "remote.git");
+		await commitAll(dir, "init");
+		await git(dir, ["push", "--set-upstream", "origin", "main"]);
+
+		const other = join(root, "other");
+		gitSync(root, ["clone", remote, other]);
+		writeFileSync(join(other, "MANIFEST.md"), "remote wins\n");
+		gitSync(other, ["add", "-A"]);
+		gitSync(other, ["commit", "-m", "remote change"]);
+		gitSync(other, ["push", "origin", "main"]);
+
+		writeFileSync(join(dir, "MANIFEST.md"), "local wins\n");
+		await commitAll(dir, "local change");
+		// Simulate the historical failure: a pull that conflicted and was
+		// never resolved (the pre-fix extension left exactly this state).
+		try {
+			gitSync(dir, ["pull", "--rebase", "--autostash"]);
+		} catch {
+			/* expected: the pull conflicts and stops mid-rebase */
+		}
+		assert.equal(
+			existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply")),
+			true,
+			"test setup: rebase must be stuck before the recovery call",
+		);
+
+		// The next sync must first finish the stuck rebase, then pull cleanly.
+		const result = await pullLibrary(dir);
+		assert.equal(result.verdict, "ok", `recovery expected ok, got ${result.verdict} (${result.detail})`);
+		assert.equal(
+			existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply")),
+			false,
+			"stuck rebase must be finished",
+		);
+		const log = await git(dir, ["log", "--pretty=%s"]);
+		assert.match(log.stdout, /local change/);
+	}, { remote: true });
+});
+
+test("pullLibrary refuses to auto-resolve conflicts outside the SOP area", async () => {
+	await withRepo(async ({ dir, root }) => {
+		const remote = join(root, "remote.git");
+		await commitAll(dir, "init");
+		await git(dir, ["push", "--set-upstream", "origin", "main"]);
+
+		const other = join(root, "other");
+		gitSync(root, ["clone", remote, other]);
+		writeFileSync(join(other, "README.md"), "remote readme\n");
+		gitSync(other, ["add", "-A"]);
+		gitSync(other, ["commit", "-m", "remote readme change"]);
+		gitSync(other, ["push", "origin", "main"]);
+
+		writeFileSync(join(dir, "README.md"), "local readme\n");
+		await commitAll(dir, "local readme change");
+
+		const result = await pullLibrary(dir);
+		assert.equal(result.verdict, "conflict", "foreign-file conflict must be left to a human");
+		assert.match(result.detail ?? "", /README/);
+		// The rebase stays in progress — the human decides.
+		assert.equal(
+			existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply")),
+			true,
+		);
+		// And the local commit survives.
+		const log = await git(dir, ["log", "--pretty=%s", "--all"]);
+		assert.match(log.stdout, /local readme change/);
+	}, { remote: true });
+});
+
+test("pullLibrary resolves a delete/modify conflict by honoring the local deletion", async () => {
+	await withRepo(async ({ dir, root }) => {
+		const remote = join(root, "remote.git");
+		mkdirSync(join(dir, "sop"), { recursive: true });
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d\n---\n\nbody\n");
+		await commitAll(dir, "init");
+		await git(dir, ["push", "--set-upstream", "origin", "main"]);
+
+		const other = join(root, "other");
+		gitSync(root, ["clone", remote, other]);
+		writeFileSync(join(other, "sop", "one.md"), "---\nname: one\ndescription: d-remote\n---\n\nremote\n");
+		gitSync(other, ["add", "-A"]);
+		gitSync(other, ["commit", "-m", "remote modifies"]);
+		gitSync(other, ["push", "origin", "main"]);
+
+		// Local: delete the SOP (an intentional `sop_save`-less removal).
+		gitSync(dir, ["rm", "sop/one.md"]);
+		await commitAll(dir, "local deletes");
+
+		const result = await pullLibrary(dir);
+		assert.equal(result.verdict, "ok", `delete/modify expected ok, got ${result.verdict} (${result.detail})`);
+		assert.equal(existsSync(join(dir, "sop", "one.md")), false, "local deletion must win");
+		assert.equal(
+			existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply")),
+			false,
+		);
+	}, { remote: true });
+});
+
+test("pullLibrary resolves a modify/delete conflict by restoring the local content", async () => {
+	await withRepo(async ({ dir, root }) => {
+		const remote = join(root, "remote.git");
+		mkdirSync(join(dir, "sop"), { recursive: true });
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d\n---\n\nbody\n");
+		await commitAll(dir, "init");
+		await git(dir, ["push", "--set-upstream", "origin", "main"]);
+
+		// Remote deletes the SOP; local modifies it. Local content must win.
+		const other = join(root, "other");
+		gitSync(root, ["clone", remote, other]);
+		gitSync(other, ["rm", "sop/one.md"]);
+		gitSync(other, ["commit", "-m", "remote deletes"]);
+		gitSync(other, ["push", "origin", "main"]);
+
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d-local\n---\n\nlocal\n");
+		await commitAll(dir, "local modifies");
+
+		const result = await pullLibrary(dir);
+		assert.equal(result.verdict, "ok", `modify/delete expected ok, got ${result.verdict} (${result.detail})`);
+		const restored = readFileSync(join(dir, "sop", "one.md"), "utf8");
+		assert.match(restored, /d-local/);
+		assert.equal(
+			existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply")),
+			false,
+		);
+	}, { remote: true });
+});
+
+test("isSopPath accepts only library-owned paths", () => {
+	assert.equal(isSopPath("MANIFEST.md"), true);
+	assert.equal(isSopPath("sop/one.md"), true);
+	assert.equal(isSopPath("projects/github.com/a/b/two.md"), true);
+	assert.equal(isSopPath("projects/deep/nested/three.md"), true);
+	// Out of bounds: the resolver must never decide for these.
+	assert.equal(isSopPath("README.md"), false);
+	assert.equal(isSopPath(".gitignore"), false);
+	assert.equal(isSopPath("sop-thing.md"), false, "prefix must not match");
+	assert.equal(isSopPath("projects.md"), false, "file, not dir");
+	assert.equal(isSopPath("sop"), false, "the dir itself is not a file");
+	assert.equal(isSopPath("docs/readme.md"), false);
 });
 
 test("looksLikeConflict recognizes git conflict output", () => {
