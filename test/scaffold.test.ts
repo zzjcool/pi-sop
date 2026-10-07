@@ -96,8 +96,13 @@ test("MANIFEST indexes the seed SOP with all five columns", async () => {
 		assert.match(manifest, /\| name \| scope \| description \| triggers \| last_verified \|/);
 		assert.match(manifest, /\| writing-sops \| global \|/);
 		assert.match(manifest, /\| 2026-09-21 \|/);
-		// the generated date is injectable, so output is deterministic under test
-		assert.match(manifest, /2026-09-21T07:00:00\.000Z/);
+		// The manifest is deterministic BYTES: no timestamp, no machine input —
+		// identical SOP sets must render identically on every machine (else
+		// every cross-machine save round-trips a timestamp conflict).
+		assert.doesNotMatch(manifest, /最后生成/);
+		await scaffoldLibrary(dir, { now: new Date("2030-01-01T00:00:00Z") });
+		const second = readFileSync(join(dir, MANIFEST_FILE), "utf8");
+		assert.equal(second, manifest, "rendering must not depend on the clock");
 	});
 });
 

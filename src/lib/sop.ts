@@ -342,19 +342,31 @@ export function descriptionHead(description: string): string {
 	return (head?.trim() || description.trim()).replace(/\r?\n/g, " ");
 }
 
-/** Render MANIFEST.md from the scanned SOPs (deterministic ordering). */
-export function renderManifest(docs: SopDoc[], generatedAt: string = new Date().toISOString()): string {
+/**
+ * Render MANIFEST.md from the scanned SOPs (deterministic ordering — and
+ * deterministic BYTES: no timestamp, no machine-local input).
+ *
+ * The manifest must be a pure function of the SOP file set: identical files
+ * on two machines must render identical bytes, otherwise every cross-machine
+ * save round-trips a timestamp conflict (review finding: "timestamp ping-pong"
+ * — v0.2's `最后生成` line made MANIFEST collide on every multi-machine
+ * pull). `generatedAt` is kept as a parameter for callers that still want a
+ * dated footer, but `sop_save` and the sync resolver pass nothing.
+ */
+export function renderManifest(docs: SopDoc[], generatedAt?: string): string {
 	const sorted = [...docs].sort((a, b) => a.name.localeCompare(b.name));
 	const lines = [
 		"# SOP MANIFEST",
 		"",
 		"> 本文件由 pi-sop 自动维护（`sop_save` 写入，`/sop init` → 状态面板 → 重建 MANIFEST 可强制刷新）。",
 		"> `scope` 列：`global` 或项目键（`git.woa.com/org/repo`），项目键对应 `projects/<键>/` 目录。",
-		`> 最后生成: ${generatedAt}`,
+	];
+	if (generatedAt) lines.push(`> 最后生成: ${generatedAt}`);
+	lines.push(
 		"",
 		"| name | scope | description | triggers | last_verified |",
 		"|---|---|---|---|---|",
-	];
+	);
 	for (const doc of sorted) {
 		lines.push(
 			`| ${cell(doc.name)} | ${cell(doc.scope)} | ${cell(descriptionHead(doc.description))} | ${cell(doc.triggers)} | ${cell(doc.lastVerified)} |`,

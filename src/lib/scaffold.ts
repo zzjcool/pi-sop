@@ -170,7 +170,7 @@ export async function scaffoldLibrary(dir: string, options: ScaffoldOptions = {}
 
 	if (rebuild || !existsSync(manifestPath)) {
 		// The seed SOP is on disk by now, so the manifest already indexes it.
-		const { content } = rebuildManifest(dir, now.toISOString());
+		const { content } = rebuildManifest(dir);
 		const previous = existsSync(manifestPath) ? readExisting(manifestPath) : "";
 		if (previous === content) {
 			kept.push(manifestPath);
@@ -220,13 +220,16 @@ export function hasSkeleton(dir: string): { manifest: boolean; sopDir: boolean; 
 /**
  * Rebuild MANIFEST.md and commit the change. Used by the status panel action
  * and after every `sop_save`.
+ *
+ * `now` is accepted for call-compatibility but unused: the manifest is
+ * deterministic (no timestamp), so there is nothing time-based to render.
  */
 export async function refreshManifest(
 	dir: string,
 	commitMessage = "chore: rebuild MANIFEST",
-	now: Date = new Date(),
+	_now: Date = new Date(),
 ): Promise<{ count: number; changed: boolean; committed: boolean }> {
-	const { content, count } = rebuildManifest(dir, now.toISOString());
+	const { content, count } = rebuildManifest(dir);
 	const path = join(dir, MANIFEST_FILE);
 	const previous = readExisting(path);
 	const changed = previous !== content;

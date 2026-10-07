@@ -202,7 +202,10 @@ test("renderManifest emits a five-column table (scope included) sorted by name",
 	const alphaIndex = manifest.indexOf("| alpha |");
 	const zebraIndex = manifest.indexOf("| zebra |");
 	assert.ok(alphaIndex < zebraIndex, "rows sorted alphabetically");
-	assert.match(manifest, /最后生成: 2026-09-21T00:00:00\.000Z/);
+	assert.match(manifest, /最后生成: 2026-09-21T00:00:00\.000Z/, "explicit generatedAt renders the footer");
+	// Default rendering carries no timestamp: deterministic bytes across
+	// machines (the cross-machine conflict fix).
+	assert.doesNotMatch(renderManifest(docs), /最后生成/);
 });
 
 test("renderManifest labels the scope of a project SOP with its project key", () => {

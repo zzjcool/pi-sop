@@ -247,6 +247,13 @@ syncLibrary():
     冲突涉及非 SOP 文件（README、手加文件等）→ 终不 force / 不 reset，
       保留 rebase 现场并 notify（唯一需要人工的场景）
     超时/网络失败 → 静默降级（本地缓存照常服务 skill），仅 debug 日志
+
+被否决的备选：`pull --rebase -X theirs` 一行即可解决内容冲突，但被否决：
+  - 策略无法按文件类区分——会把 README 等非 SOP 文件也自动取一侧，
+    违反「机器不替人决定非 SOP 文件」的冻结规则
+  - 对 modify/delete 冲突仍会卡死（-X 只管内容冲突）
+  脏工作区门禁：pull 前检测 tracked 文件有未提交修改 → 跳过本次同步
+  （--autostash 的 stash 在冲突场景下 pop 时会打架，实测会静默丢未提交内容）。
 ```text
 
 push（sop_save 内）：commit 总是先落本地；push 失败 → 结果文本带警告"已本地提交，推送失败：<原因>，下次会话重试"。**绝不 force-push**（冻结规则）。

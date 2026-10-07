@@ -89,7 +89,11 @@ function gitEnv(): NodeJS.ProcessEnv {
 	return env;
 }
 
-function run(command: string, args: string[], options: { cwd?: string; timeout: number }): Promise<GitResult> {
+function run(
+	command: string,
+	args: string[],
+	options: { cwd?: string; timeout: number; extraEnv?: NodeJS.ProcessEnv },
+): Promise<GitResult> {
 	// execFile's own `timeout` + `killSignal: "SIGKILL"` is the single timeout
 	// mechanism: Node kills the child and reports error.killed === true.
 	return new Promise((resolvePromise) => {
@@ -102,7 +106,7 @@ function run(command: string, args: string[], options: { cwd?: string; timeout: 
 				killSignal: "SIGKILL",
 				maxBuffer: 4 * 1024 * 1024,
 				encoding: "utf8",
-				env: gitEnv(),
+				env: options.extraEnv ? { ...gitEnv(), ...options.extraEnv } : gitEnv(),
 				windowsHide: true,
 			},
 			(error, stdout, stderr) => {
@@ -125,8 +129,9 @@ export function git(
 	dir: string,
 	args: string[],
 	timeout: number = TIMEOUTS.local,
+	options: { extraEnv?: NodeJS.ProcessEnv } = {},
 ): Promise<GitResult> {
-	return run("git", args, { cwd: dir, timeout });
+	return run("git", args, { cwd: dir, timeout, extraEnv: options.extraEnv });
 }
 
 /** Run git without a working tree (used before the dir exists). */
@@ -149,8 +154,6 @@ export interface ConflictResolution {
 	resolved: boolean;
 	/** Number of rebased local commits that needed resolution. */
 	steps: number;
-	/** Commit-sha of any local commit that was dropped for touching SOPs only. */
-	dropped?: string;
 	/** First error line when the automated resolution had to give up. */
 	detail?: string;
 }
@@ -191,47 +194,19 @@ async function unmergedPaths(dir: string): Promise<string[]> {
  *
  * `git rebase --continue` normally opens an editor to reword the message of the
  * commit being replayed; `GIT_EDITOR=true` accepts the existing message so the
- * flow never blocks on a prompt (the frozen "never prompt" rule). An
- * "nothing to commit" failure means the replayed commit became empty after
- * resolution (e.g. a MANIFEST-only rebuild whose remote counterpart won — the
- * manifest is regenerated afterwards anyway); `--skip` drops it, which is
- * exactly right: dropping content would lose SOPs, but an empty commit
- * carries none.
+ * flow never blocks on a prompt (the frozen "never prompt" rule).
+ *
+ * `rebase --skip` is deliberately NOT triggered from string-matching the
+ * output (wording varies across git versions): the caller decides on STATE —
+ * when a failed `--continue` left no conflicts and no progress, `--skip` is
+ * the correct way forward for a commit that became empty after resolution.
+ * Dropping an empty commit loses nothing: dropping content would lose SOPs,
+ * but an empty commit carries none.
  */
 async function rebaseContinue(dir: string): Promise<GitResult> {
-	const env = { ...process.env, GIT_EDITOR: "true" };
-	// `run()` builds its own env; go through a one-off promise to inject ours.
-	const result = await new Promise<GitResult>((resolvePromise) => {
-		execFile(
-			"git",
-			["rebase", "--continue"],
-			{
-				cwd: dir,
-				timeout: TIMEOUTS.continue,
-				killSignal: "SIGKILL",
-				maxBuffer: 4 * 1024 * 1024,
-				encoding: "utf8",
-				env: { ...gitEnv(), ...env },
-				windowsHide: true,
-				},
-			(error, stdout, stderr) => {
-				const exitError = error as (Error & { code?: number | string; killed?: boolean }) | null;
-				resolvePromise({
-					ok: !error,
-					code: error ? (typeof exitError?.code === "number" ? exitError.code : null) : 0,
-					stdout: stdout ?? "",
-					stderr: stderr ?? "",
-					timedOut: exitError?.killed === true,
-					command: "git rebase --continue",
-				});
-			},
-		);
+	return git(dir, ["rebase", "--continue"], TIMEOUTS.continue, {
+		extraEnv: { GIT_EDITOR: "true" },
 	});
-	if (result.ok) return result;
-	if (/nothing to commit|no changes|did not receive any changes/i.test(`${result.stdout}\n${result.stderr}`)) {
-		return git(dir, ["rebase", "--skip"], TIMEOUTS.continue);
-	}
-	return result;
 }
 
 /**
@@ -295,41 +270,60 @@ async function resolveRebase(dir: string): Promise<ConflictResolution> {
 			// MANIFEST (or any remaining sop-path conflict): regenerate from disk.
 			const manifestConflicts = conflicted.filter((p) => p === "MANIFEST.md");
 			if (manifestConflicts.length > 0) {
-				const { content } = rebuildManifest(dir, new Date().toISOString());
+				const { content } = rebuildManifest(dir);
 				writeFileSync(join(dir, "MANIFEST.md"), content, "utf8");
 				await git(dir, ["add", "--", "MANIFEST.md"], TIMEOUTS.local);
 			}
 		}
-		// Nothing unmerged but a rebase marker still present: a stop without
-		// conflicts (rare) — continue anyway; if nothing to commit, skip.
+		// A stop without unmerged paths (rare — e.g. a SIGKILLed continue):
+		// try to advance. If the continue failed but nothing was unmerged, the
+		// replayed commit became empty after resolution — `--skip` is decided on
+		// STATE, not on git's (version-dependent) wording.
 		const step = await rebaseContinue(dir);
 		steps++;
-		if (!step.ok && !rebaseInProgress(dir)) {
-			return { resolved: false, steps, detail: `rebase --continue 失败: ${firstLine(step.stderr || step.stdout)}` };
+		if (step.ok || rebaseInProgress(dir)) {
+			// Advanced to the next stop, or finished — loop to re-probe.
+			if (!rebaseInProgress(dir)) break;
+			continue;
 		}
-		if (!rebaseInProgress(dir)) {
-			// Rebase finished: refresh MANIFEST from the final file set so the
-			// "local wins" SOP picks are reflected in the index too.
-			const { content } = rebuildManifest(dir, new Date().toISOString());
-			const manifestPath = join(dir, "MANIFEST.md");
-			const previous = readFileSyncSafe(manifestPath);
-			if (previous !== content) {
-				writeFileSync(manifestPath, content, "utf8");
-				await git(dir, ["add", "--", "MANIFEST.md"], TIMEOUTS.local);
-				const commit = await git(
-				dir,
-				["commit", "-m", "chore: auto-resolve MANIFEST after sync conflict", "--", "MANIFEST.md"],
-				TIMEOUTS.local,
-				);
-				if (!commit.ok) {
-				return { resolved: false, steps, detail: `MANIFEST 提交失败: ${firstLine(commit.stderr)}` };
-				}
+		// Continue failed, rebase still in place, nothing unmerged: skip once.
+		const remaining = await unmergedPaths(dir);
+		if (remaining.length === 0) {
+			const skip = await git(dir, ["rebase", "--skip"], TIMEOUTS.continue);
+			steps++;
+			if (!skip.ok && rebaseInProgress(dir)) {
+				return {
+					resolved: false,
+				steps,
+					detail: `rebase --continue/--skip 失败: ${firstLine(step.stderr || step.stdout)}`,
+				};
 			}
-			return { resolved: true, steps };
+			if (!rebaseInProgress(dir)) break;
+			continue;
 		}
-		// Else: the continue advanced to the next stop — loop again.
+		return { resolved: false, steps, detail: `rebase --continue 失败: ${firstLine(step.stderr || step.stdout)}` };
 	}
-	return { resolved: false, steps, detail: "rebase 步数超限（50），已停止自动处理" };
+	if (rebaseInProgress(dir)) {
+		return { resolved: false, steps, detail: "rebase 步数超限（50），已停止自动处理" };
+	}
+	// Rebase finished: refresh MANIFEST from the final file set so the
+	// "local wins" SOP picks are reflected in the index too.
+	const { content } = rebuildManifest(dir);
+	const manifestPath = join(dir, "MANIFEST.md");
+	const previous = readFileSyncSafe(manifestPath);
+	if (previous !== content) {
+		writeFileSync(manifestPath, content, "utf8");
+		await git(dir, ["add", "--", "MANIFEST.md"], TIMEOUTS.local);
+		// commitAll (not bare git commit): carries the identity fallback for
+		// machines without user.name/user.email configured (review finding).
+		const commit = await commitAll(dir, "chore: auto-resolve MANIFEST after sync conflict", [
+			"MANIFEST.md",
+		]);
+		if (!commit.committed) {
+			return { resolved: false, steps, detail: `MANIFEST 提交失败: ${commit.detail ?? commit.reason ?? ""}` };
+		}
+	}
+	return { resolved: true, steps };
 }
 
 function readFileSyncSafe(path: string): string {
@@ -476,6 +470,26 @@ async function acquireInProcess(lockPath: string): Promise<LockHandle> {
 }
 
 /**
+ * True when the worktree has uncommitted changes to TRACKED files (untracked
+ * files are fine — git never autostashes those).
+ *
+ * A dirty worktree is dangerous to pull with `--autostash`: when the pull also
+ * conflicts, the autostash is applied back at the END of the (auto-resolved)
+ * rebase, and its pop can itself conflict — leaving a stuck UD state the
+ * resolver never sees because it happens inside the pull process (review
+ * finding: silent loss of uncommitted edits). Refusing to pull on a dirty
+ * tree sidesteps the whole class: the user's uncommitted work stays put, the
+ * next commit lands, and the pull retries afterwards.
+ */
+async function hasTrackedChanges(dir: string): Promise<boolean> {
+	const status = await git(dir, ["status", "--porcelain"], TIMEOUTS.local);
+	if (!status.ok) return false; // cannot tell → let the pull proceed
+	return status.stdout
+		.split(/\r?\n/)
+		.some((line) => line.trim().length > 0 && !line.startsWith("??"));
+}
+
+/**
  * Pull with `--rebase --autostash` under the library lock.
  *
  * `dir` is the library WORKTREE (not `<dir>/.git`): `git pull` refuses to run
@@ -484,8 +498,9 @@ async function acquireInProcess(lockPath: string): Promise<LockHandle> {
  *
  * Never forces, never resets. A conflict inside the SOP area is resolved
  * automatically (local SOPs win, MANIFEST regenerates); a conflict involving
- * foreign files leaves the rebase in place and reports it. Network/timeout
- * failures degrade silently.
+ * foreign files leaves the rebase in place and reports it. A dirty worktree
+ * skips the pull entirely (uncommitted user work must never be autostashed
+ * into a conflicting rebase). Network/timeout failures degrade silently.
  */
 export async function pullLibrary(dir: string): Promise<SyncResult> {
 	const lock = await withLock(lockPathForDir(dir), async () => {
@@ -501,6 +516,14 @@ export async function pullLibrary(dir: string): Promise<SyncResult> {
 					detail: fix.detail,
 				};
 			}
+		}
+		// Dirty worktree: refuse to autostash user work into a possibly
+		// conflicting rebase. Untracked files are harmless (never autostashed).
+		if (await hasTrackedChanges(dir)) {
+			return {
+				verdict: "skipped" as SyncVerdict,
+				message: "库有未提交的修改，已跳过同步（先提交或等待下次保存后重试）",
+			};
 		}
 		const args = ["pull", "--rebase", "--autostash"];
 		const result = await git(dir, args, TIMEOUTS.pull);
@@ -519,9 +542,9 @@ export async function pullLibrary(dir: string): Promise<SyncResult> {
 			};
 		}
 		return {
-			verdict: "failed" as SyncVerdict,
-			message: "同步失败，已降级为本地缓存",
-			detail: result.timedOut ? "timeout" : firstLine(result.stderr || result.stdout),
+				verdict: "failed" as SyncVerdict,
+				message: "同步失败，已降级为本地缓存",
+				detail: result.timedOut ? "timeout" : firstLine(result.stderr || result.stdout),
 		};
 	});
 	if (!lock.acquired) {

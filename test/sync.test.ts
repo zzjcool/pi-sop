@@ -187,18 +187,22 @@ test("pullLibrary pulls a new commit from a real remote", async () => {
 test("pullLibrary auto-resolves a SOP conflict (local content wins, MANIFEST regenerated)", async () => {
 	await withRepo(async ({ dir, root }) => {
 		const remote = join(root, "remote.git");
+		mkdirSync(join(dir, "sop"), { recursive: true });
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d\n---\n\nbody\n");
 		await commitAll(dir, "init");
 		await git(dir, ["push", "--set-upstream", "origin", "main"]);
 
-		// Someone else commits a conflicting change to the same files.
+		// Someone else commits a conflicting change to the same SOP.
 		const other = join(root, "other");
 		gitSync(root, ["clone", remote, other]);
+		writeFileSync(join(other, "sop", "one.md"), "---\nname: one\ndescription: d-remote\n---\n\nremote body\n");
 		writeFileSync(join(other, "MANIFEST.md"), "remote wins\n");
 		gitSync(other, ["add", "-A"]);
 		gitSync(other, ["commit", "-m", "remote change"]);
 		gitSync(other, ["push", "origin", "main"]);
 
-		// We change the same file differently.
+		// We change the same SOP differently + MANIFEST.
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d-local\n---\n\nlocal body\n");
 		writeFileSync(join(dir, "MANIFEST.md"), "local wins\n");
 		await commitAll(dir, "local change");
 		const localSha = (await git(dir, ["rev-parse", "HEAD"])).stdout.trim();
@@ -206,9 +210,15 @@ test("pullLibrary auto-resolves a SOP conflict (local content wins, MANIFEST reg
 		const result = await pullLibrary(dir);
 		assert.equal(result.verdict, "ok", `expected auto-resolution, got ${result.verdict} (${result.detail})`);
 
-		// No force, no reset: the local commit still exists (replayed).
-		const log = await git(dir, ["log", "--pretty=%s"]);
-		assert.match(log.stdout, /local change/);
+		// The core invariant: LOCAL SOP CONTENT WINS (this is the line a
+		// theirs→ours polarity regression would turn red).
+		const sop = readFileSync(join(dir, "sop", "one.md"), "utf8");
+		assert.match(sop, /d-local/, "local SOP content must win the conflict");
+		assert.doesNotMatch(sop, /d-remote/);
+
+		// No force, no reset: the local commit is replayed (patch-equivalent).
+		const replayed = await git(dir, ["log", "--pretty=%s"]);
+		assert.match(replayed.stdout, /local change/);
 		void localSha;
 		// The rebase is FINISHED — the v0.3 fix: no stuck state left behind.
 		assert.equal(
@@ -230,30 +240,73 @@ test("pullLibrary auto-resolves a SOP conflict (local content wins, MANIFEST reg
 test("pullLibrary auto-resolves a multi-commit rebase, each step conflicting", async () => {
 	await withRepo(async ({ dir, root }) => {
 		const remote = join(root, "remote.git");
+		mkdirSync(join(dir, "sop"), { recursive: true });
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d\n---\n\nbody\n");
 		await commitAll(dir, "init");
 		await git(dir, ["push", "--set-upstream", "origin", "main"]);
 
 		const other = join(root, "other");
 		gitSync(root, ["clone", remote, other]);
-		writeFileSync(join(other, "MANIFEST.md"), "remote 1\n");
+		writeFileSync(join(other, "sop", "one.md"), "---\nname: one\ndescription: d-remote\n---\n\nremote\n");
 		gitSync(other, ["add", "-A"]);
 		gitSync(other, ["commit", "-m", "remote change 1"]);
 		gitSync(other, ["push", "origin", "main"]);
 
-		// Two local commits, both conflicting on MANIFEST.md.
-		writeFileSync(join(dir, "MANIFEST.md"), "local 1\n");
+		// Two local commits, both conflicting on the same SOP + MANIFEST.
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d-local-1\n---\n\nlocal 1\n");
 		await commitAll(dir, "local change 1");
-		writeFileSync(join(dir, "MANIFEST.md"), "local 2\n");
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d-local-2\n---\n\nlocal 2\n");
 		await commitAll(dir, "local change 2");
 
 		const result = await pullLibrary(dir);
 		assert.equal(result.verdict, "ok", `multi-step expected ok, got ${result.verdict} (${result.detail})`);
 		const log = await git(dir, ["log", "--pretty=%s"]);
 		assert.match(log.stdout, /local change 1/);
-		assert.match(log.stdout, /local change 2/);
+		assert.match(log.stdout, /local change 2/, "the second SOP-carrying commit must survive");
+		// Local content wins at BOTH steps (mutation guard: theirs/ours polarity).
+		const final = readFileSync(join(dir, "sop", "one.md"), "utf8");
+		assert.match(final, /d-local-2/, "the newest local SOP content must win");
 		assert.equal(
 			existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply")),
 			false,
+		);
+	}, { remote: true });
+});
+
+test("a MANIFEST-only local commit becomes empty after auto-resolution and is skipped", async () => {
+	await withRepo(async ({ dir, root }) => {
+		const remote = join(root, "remote.git");
+		// A library whose SOP set renders exactly "| _(empty)_ |" — the regen
+		// output for zero SOPs. The remote MANIFEST already matches it; the
+		// local commit changes MANIFEST to something else. After resolution the
+		// replay lands on the same bytes as the base → empty → must be skipped.
+		const REGEN = readFileSync(join(dir, "MANIFEST.md"), "utf8");
+		void REGEN;
+		writeFileSync(join(dir, "MANIFEST.md"), "| name |\n");
+		await commitAll(dir, "init");
+		await git(dir, ["push", "--set-upstream", "origin", "main"]);
+
+		// Remote already carries the deterministic regen for this file set.
+		const other = join(root, "other");
+		gitSync(root, ["clone", remote, other]);
+		const { content } = await import("../src/lib/sop.ts").then((m) => m.rebuildManifest(other));
+		writeFileSync(join(other, "MANIFEST.md"), content);
+		gitSync(other, ["add", "-A"]);
+		gitSync(other, ["commit", "-m", "remote carries the regen"]);
+		gitSync(other, ["push", "origin", "main"]);
+
+		// Local: a commit that ONLY touches MANIFEST with different bytes.
+		writeFileSync(join(dir, "MANIFEST.md"), "local rebuild\n");
+		await commitAll(dir, "local manifest-only");
+
+		const result = await pullLibrary(dir);
+		assert.equal(result.verdict, "ok", `empty-commit skip expected ok, got ${result.verdict} (${result.detail})`);
+		const log = await git(dir, ["log", "--pretty=%s"]);
+		assert.doesNotMatch(log.stdout, /local manifest-only/, "the empty replay must be skipped");
+		assert.equal(
+			existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply")),
+			false,
+			"no stuck rebase after skipping an empty commit",
 		);
 	}, { remote: true });
 });
@@ -387,11 +440,130 @@ test("pullLibrary resolves a modify/delete conflict by restoring the local conte
 	}, { remote: true });
 });
 
+test("pullLibrary refuses to autostash uncommitted tracked work (dirty gate)", async () => {
+	await withRepo(async ({ dir, root }) => {
+		const remote = join(root, "remote.git");
+		mkdirSync(join(dir, "sop"), { recursive: true });
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d\n---\n\nbody\n");
+		await commitAll(dir, "init");
+		await git(dir, ["push", "--set-upstream", "origin", "main"]);
+
+		// Remote diverges so the pull WOULD conflict.
+		const other = join(root, "other");
+		gitSync(root, ["clone", remote, other]);
+		writeFileSync(join(other, "sop", "one.md"), "---\nname: one\ndescription: d-remote\n---\n\nremote\n");
+		gitSync(other, ["add", "-A"]);
+		gitSync(other, ["commit", "-m", "remote change"]);
+		gitSync(other, ["push", "origin", "main"]);
+
+		// Uncommitted (dirty) local edit to a tracked file.
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d-dirty-uncommitted\n---\n\ndirty\n");
+
+		const result = await pullLibrary(dir);
+		assert.equal(result.verdict, "skipped", "dirty tree must skip the pull");
+		// The uncommitted edit is untouched — no autostash, no loss.
+		const sop = readFileSync(join(dir, "sop", "one.md"), "utf8");
+		assert.match(sop, /d-dirty-uncommitted/);
+		const stash = await git(dir, ["stash", "list"]);
+		assert.equal(stash.stdout.trim(), "", "no autostash residue");
+	}, { remote: true });
+});
+
+test("pullLibrary syncs normally with only untracked noise present", async () => {
+	await withRepo(async ({ dir, root }) => {
+		const remote = join(root, "remote.git");
+		await commitAll(dir, "init");
+		await git(dir, ["push", "--set-upstream", "origin", "main"]);
+		const other = join(root, "other");
+		gitSync(root, ["clone", remote, other]);
+		writeFileSync(join(other, "MANIFEST.md"), "remote\n");
+		gitSync(other, ["add", "-A"]);
+		gitSync(other, ["commit", "-m", "remote change"]);
+		gitSync(other, ["push", "origin", "main"]);
+		// Untracked files (editor droppings) must NOT trigger the dirty gate.
+		writeFileSync(join(dir, "._noise"), "x");
+		const result = await pullLibrary(dir);
+		assert.equal(result.verdict, "ok", `untracked-only noise must not block sync (${result.detail})`);
+	}, { remote: true });
+});
+
+test("pullLibrary auto-resolves a rename conflict (local edit lands on the new name)", async () => {
+	await withRepo(async ({ dir, root }) => {
+		const remote = join(root, "remote.git");
+		mkdirSync(join(dir, "sop"), { recursive: true });
+		writeFileSync(join(dir, "sop", "old-name.md"), "---\nname: old-name\ndescription: d\n---\n\nbody\n");
+		await commitAll(dir, "init");
+		await git(dir, ["push", "--set-upstream", "origin", "main"]);
+
+		// Remote renames the SOP.
+		const other = join(root, "other");
+		gitSync(root, ["clone", remote, other]);
+		gitSync(other, ["mv", "sop/old-name.md", "sop/new-name.md"]);
+		gitSync(other, ["commit", "-m", "remote renames"]);
+		gitSync(other, ["push", "origin", "main"]);
+
+		// Local edits the old name.
+		writeFileSync(join(dir, "sop", "old-name.md"), "---\nname: old-name\ndescription: d-local\n---\n\nlocal edit\n");
+		await commitAll(dir, "local edits");
+
+		const result = await pullLibrary(dir);
+		assert.equal(result.verdict, "ok", `rename conflict expected ok, got ${result.verdict} (${result.detail})`);
+		assert.equal(
+			existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply")),
+			false,
+			"no stuck rebase after a rename conflict",
+		);
+	}, { remote: true });
+});
+
+test("pullLibrary recovers from a resolver killed mid-rebase with a clean index", async () => {
+	await withRepo(async ({ dir, root }) => {
+		const remote = join(root, "remote.git");
+		mkdirSync(join(dir, "sop"), { recursive: true });
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d\n---\n\nbody\n");
+		await commitAll(dir, "init");
+		await git(dir, ["push", "--set-upstream", "origin", "main"]);
+
+		const other = join(root, "other");
+		gitSync(root, ["clone", remote, other]);
+		writeFileSync(join(other, "sop", "one.md"), "---\nname: one\ndescription: d-remote\n---\n\nremote\n");
+		gitSync(other, ["add", "-A"]);
+		gitSync(other, ["commit", "-m", "remote change"]);
+		gitSync(other, ["push", "origin", "main"]);
+
+		writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d-local\n---\n\nlocal\n");
+		await commitAll(dir, "local change");
+
+		// Simulate: pull conflicted, resolver resolved + staged, then was
+		// SIGKILLed BEFORE `rebase --continue` — index clean, marker present.
+		try {
+			gitSync(dir, ["pull", "--rebase", "--autostash"]);
+		} catch {
+			/* conflicts as expected */
+		}
+		gitSync(dir, ["checkout", "--theirs", "--", "sop/one.md"]);
+		gitSync(dir, ["add", "sop/one.md"]);
+		const unmerged = await git(dir, ["diff", "--name-only", "--diff-filter=U"]);
+		assert.equal(unmerged.stdout.trim(), "", "test setup: index must be clean");
+
+		const result = await pullLibrary(dir);
+		assert.equal(result.verdict, "ok", `killed-resolver recovery expected ok, got ${result.verdict} (${result.detail})`);
+		assert.equal(
+			existsSync(join(dir, ".git", "rebase-merge")) || existsSync(join(dir, ".git", "rebase-apply")),
+			false,
+			"the interrupted rebase must be finished",
+		);
+	}, { remote: true });
+});
+
 test("isSopPath accepts only library-owned paths", () => {
 	assert.equal(isSopPath("MANIFEST.md"), true);
 	assert.equal(isSopPath("sop/one.md"), true);
 	assert.equal(isSopPath("projects/github.com/a/b/two.md"), true);
 	assert.equal(isSopPath("projects/deep/nested/three.md"), true);
+	// Windows-style separators are normalized before matching.
+	assert.equal(isSopPath("sop\\one.md"), true, "backslash separator must normalize");
+	assert.equal(isSopPath("projects\\github.com\\a\\b\\two.md"), true);
 	// Out of bounds: the resolver must never decide for these.
 	assert.equal(isSopPath("README.md"), false);
 	assert.equal(isSopPath(".gitignore"), false);
