@@ -247,6 +247,7 @@ test("seed body documents the project scope and its uniqueness rule", () => {
 
 test(".gitignore ignores OS noise and the lock file", () => {
 	assert.ok(GITIGNORE_CONTENT.includes(".DS_Store"));
+	assert.ok(GITIGNORE_CONTENT.includes("._*"), "macOS AppleDouble noise must be ignored");
 	assert.ok(GITIGNORE_CONTENT.includes("*.swp"));
 	assert.ok(GITIGNORE_CONTENT.includes(".pi-sop-lock"));
 	// an empty entry from the join() padding must not swallow the newline format

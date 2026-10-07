@@ -25,6 +25,7 @@ export const SEED_SOP_SLUG = "writing-sops";
 export const GITIGNORE_CONTENT = [
 	"# OS / editor noise",
 	".DS_Store",
+	"._*",
 	"*.swp",
 	"*~",
 	"",
