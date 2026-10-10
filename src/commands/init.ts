@@ -717,7 +717,7 @@ export async function printStatus(ctx: ExtensionCommandContext): Promise<void> {
 		`库路径: ${dir} (${describeState(probe)})`,
 		`远端仓库: ${config.repo ?? "未配置（自动克隆不可用）"}`,
 	];
-	if (resolved.stale) lines.push(`提示: 配置的 libDir ${resolved.stale} 在本机不存在，已改用 ${dir}`);
+	if (resolved.stale) lines.push(`提示: 配置的 libDir ${resolved.stale} 在本机不可用，已改用 ${dir}`);
 	if (probe.remote) lines.push(`远端: ${probe.remote} (${probe.branch ?? "?"})`);
 	const { docs } = scanSopDir(dir);
 	lines.push(`SOP 数量: ${docs.length}`);

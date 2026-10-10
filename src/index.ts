@@ -108,7 +108,7 @@ interface NotifyContext {
 }
 
 /** Delay before checking whether another process finished a concurrent clone. */
-export const AUTO_CLONE_RETRY_DELAY_MS = 1500;
+export const autoCloneRetryDelay = { ms: 1500 };
 
 function cloneFailureNotice(detail: string): string {
 	return `pi-sop: 自动克隆失败（${detail || "未知错误"}）。网络恢复后重启会话会自动重试，或运行 /sop init 手动处理。`;
@@ -144,14 +144,12 @@ async function autoCloneLibrary(
 	ctx: NotifyContext,
 ): Promise<void> {
 	let cloned: Awaited<ReturnType<typeof clone>>;
-	let thrownFailureNotice: string | undefined;
 	try {
 		cloned = await clone(candidate.repo, candidate.target);
 	} catch (error) {
 		const detail = error instanceof Error ? firstLine(error.message) : firstLine(String(error));
 		// Keep unexpected spawn failures on the same bounded concurrent-clone
 		// recovery path as ordinary non-zero git exit codes.
-		thrownFailureNotice = cloneFailureNotice(detail);
 		cloned = {
 			ok: false,
 			code: null,
@@ -177,7 +175,7 @@ async function autoCloneLibrary(
 		// A competing process can create the target first, causing our clone to
 		// fail while that process is still checking out files. Keep session_start
 		// non-blocking and retry the local probe once after a bounded delay.
-		await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, AUTO_CLONE_RETRY_DELAY_MS));
+		await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, autoCloneRetryDelay.ms));
 		const retryProbe = probeLibrary(candidate.target);
 		if (isCloneUsable(retryProbe)) {
 			markCloneInitialized(candidate, ctx);
@@ -189,8 +187,7 @@ async function autoCloneLibrary(
 		}
 	}
 
-	const detail = firstLine(cloned.stderr) || "未知错误";
-	notifyAutoClone(ctx, thrownFailureNotice ?? cloneFailureNotice(detail), "warning");
+	notifyAutoClone(ctx, cloneFailureNotice(firstLine(cloned.stderr)), "warning");
 }
 
 function notifyAutoClone(ctx: NotifyContext, message: string, type: string): void {
@@ -649,7 +646,7 @@ async function commandStatus(ctx: ExtensionCommandContext): Promise<void> {
 		`状态:   ${describeState(probe)}`,
 		`远端仓库: ${config.repo ?? "未配置（自动克隆不可用）"}`,
 	];
-	if (stale) lines.push(`提示: 配置的 libDir ${stale} 在本机不存在，已改用 ${dir}`);
+	if (stale) lines.push(`提示: 配置的 libDir ${stale} 在本机不可用，已改用 ${dir}`);
 	if (probe.remote) lines.push(`远端:   ${probe.remote} (${probe.branch ?? "?"})`);
 	if (isUsable(probe.state)) {
 		const { docs } = scanSopDir(dir);
