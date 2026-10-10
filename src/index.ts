@@ -24,9 +24,11 @@ import { Type } from "typebox";
 
 import { parseInitArgs, runInit } from "./commands/init.ts";
 import {
+	markInitialized,
 	readConfig,
 	resolveLibDir,
 	writeConfig,
+	type ResolvedLibDir,
 } from "./lib/config.ts";
 import {
 	describeState,
@@ -57,15 +59,16 @@ import {
 	resolveProjectKeys,
 } from "./lib/project.ts";
 import {
+	clone,
 	commitAll,
+	firstLine,
 	pushLibrary,
 	syncLibrary,
 	withLock,
 } from "./lib/sync.ts";
 
-/** Notify text (design §7, one-pass final wording). */
+/** Shared save/sync notification text. */
 const NOTIFY = {
-	uninitialized: "pi-sop: SOP 库未初始化，运行 /sop init 开始",
 	disabledSave: "pi-sop 已禁用，请用户运行 /sop init 重新启用",
 	notInitialized:
 		"SOP 库未初始化。请让用户运行 /sop init，或将 PI_SOP_DIR 指向已有库。",
@@ -74,6 +77,8 @@ const NOTIFY = {
 
 /** Once-per-process flag: `resume`/`fork` must not re-notify. */
 let notifiedUninitialized = false;
+/** A machine-independent repo is cloned at most once per process. */
+let attemptedAutoClone = false;
 
 /** Conflict signatures already warned about in this process. */
 const reportedConflicts = new Set<string>();
@@ -81,6 +86,7 @@ const reportedConflicts = new Set<string>();
 /** Test seam: allow re-notifying in a fresh process-like context. */
 export function resetNotifyFlag(): void {
 	notifiedUninitialized = false;
+	attemptedAutoClone = false;
 	reportedConflicts.clear();
 }
 
@@ -88,14 +94,75 @@ export function resetNotifyFlag(): void {
 /** Path + state helpers                                                 */
 /** ------------------------------------------------------------------ */
 
-interface Resolved {
-	dir: string;
+interface Resolved extends ResolvedLibDir {
 	probe: ProbeResult;
 }
 
 function resolveState(): Resolved {
-	const { dir } = resolveLibDir();
-	return { dir, probe: probeLibrary(dir) };
+	const resolved = resolveLibDir();
+	return { ...resolved, probe: probeLibrary(resolved.dir) };
+}
+
+interface NotifyContext {
+	ui?: { notify(text: string, type?: string): void };
+}
+
+/** Background clone path. It never prompts and reports only through notify. */
+async function autoCloneLibrary(
+	candidate: NonNullable<ResolvedLibDir["autoClone"]>,
+	ctx: NotifyContext,
+): Promise<void> {
+	let cloned;
+	try {
+		cloned = await clone(candidate.repo, candidate.target);
+	} catch (error) {
+		const detail = error instanceof Error ? firstLine(error.message) : firstLine(String(error));
+		notifyAutoClone(
+			ctx,
+			`pi-sop: 自动克隆失败（${detail || "未知错误"}）。网络恢复后重启会话会自动重试，或运行 /sop init 手动处理。`,
+			"warning",
+		);
+		return;
+	}
+
+	const postProbe = probeLibrary(candidate.target);
+	if (cloned.ok && postProbe.state === "malformed") {
+		notifyAutoClone(
+			ctx,
+			`pi-sop: 已克隆 ${candidate.target}，但仓库结构不像 SOP 库（无 MANIFEST.md / sop/）。运行 /sop init 可补齐骨架。`,
+			"warning",
+		);
+		return;
+	}
+
+	if (postProbe.state === "ready" || postProbe.state === "no-remote") {
+		const now = new Date().toISOString();
+		markInitialized(candidate.target, {
+			repo: candidate.repo,
+			lastSyncAt: now,
+		});
+		notifyAutoClone(
+			ctx,
+			`pi-sop: 本机没有 SOP 库，已自动从 ${candidate.repo} 克隆到 ${candidate.target}（${countSops(candidate.target)} 个 SOP）。下次会话启动时生效。`,
+			"info",
+		);
+		return;
+	}
+
+	const detail = firstLine(cloned.stderr) || "未知错误";
+	notifyAutoClone(
+		ctx,
+		`pi-sop: 自动克隆失败（${detail}）。网络恢复后重启会话会自动重试，或运行 /sop init 手动处理。`,
+		"warning",
+	);
+}
+
+function notifyAutoClone(ctx: NotifyContext, message: string, type: string): void {
+	try {
+		ctx.ui?.notify(message, type);
+	} catch {
+		// The context may have gone stale while the fire-and-forget clone ran.
+	}
 }
 
 /** ------------------------------------------------------------------ */
@@ -111,7 +178,11 @@ export default function piSop(pi: ExtensionAPI): void {
 		const config = readConfig();
 		if (config.enabled === false) return;
 
-		const { dir, probe } = resolveState();
+		const { dir, probe, autoClone, stale } = resolveState();
+		if (isUsable(probe.state) && probe.remote && !config.repo) {
+			writeConfig({ repo: probe.remote });
+			config.repo = probe.remote;
+		}
 		if (isSaveable(probe.state)) {
 			// Duplicate-name guard, fs-only and best-effort: `sop_save` refuses such
 			// writes, but a hand-written file can still collide, and pi silently
@@ -148,12 +219,30 @@ export default function piSop(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Never initialized: one notification per process, and only when the
-		// user has not already made a choice (config file absent).
-		if (!notifiedUninitialized && !config.initializedAt && probe.state === "missing") {
+		// A machine-independent remote lets a new machine hydrate the default
+		// library in the background. The event handler never waits for git.
+		if (probe.state === "missing" && autoClone && !attemptedAutoClone) {
+			attemptedAutoClone = true;
+			void autoCloneLibrary(autoClone, ctx).catch((error) => {
+				const detail = error instanceof Error ? firstLine(error.message) : firstLine(String(error));
+				notifyAutoClone(
+					ctx,
+					`pi-sop: 自动克隆失败（${detail || "未知错误"}）。网络恢复后重启会话会自动重试，或运行 /sop init 手动处理。`,
+					"warning",
+				);
+			});
+		}
+
+		// Report missing libraries once per process unless an automatic clone
+		// candidate owns the notification path. initializedAt is machine-local
+		// history and cannot prove that the library still exists here.
+		if (!notifiedUninitialized && probe.state === "missing" && !autoClone) {
 			notifiedUninitialized = true;
-			ctx.ui.notify(NOTIFY.uninitialized, "info");
-			void dir;
+			const staleNote = stale ? `（配置里的 ${stale} 来自其他机器）` : "";
+			ctx.ui.notify(
+				`pi-sop: 库路径 ${dir} 在本机不存在${staleNote}。运行 /sop init 初始化，或运行 /sop init --clone <url> 配置自动克隆。`,
+				"info",
+			);
 		}
 	});
 
@@ -522,12 +611,14 @@ async function saveSop(params: SaveParams, cwd?: string): Promise<ToolText> {
 
 async function commandStatus(ctx: ExtensionCommandContext): Promise<void> {
 	const config = readConfig();
-	const { dir, probe } = resolveState();
+	const { dir, probe, stale } = resolveState();
 	const lines = [
 		config.enabled ? "pi-sop: 已启用" : "pi-sop: 已禁用（/sop init 重新启用）",
 		`库路径: ${dir}`,
 		`状态:   ${describeState(probe)}`,
+		`远端仓库: ${config.repo ?? "未配置（自动克隆不可用）"}`,
 	];
+	if (stale) lines.push(`提示: 配置的 libDir ${stale} 在本机不存在，已改用 ${dir}`);
 	if (probe.remote) lines.push(`远端:   ${probe.remote} (${probe.branch ?? "?"})`);
 	if (isUsable(probe.state)) {
 		const { docs } = scanSopDir(dir);

@@ -146,6 +146,8 @@ import { runInit as _runInit, cloneFlow, linkFlow } from "../src/commands/init.t
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createSandbox } from "./helpers.ts";
+import { readConfig, writeConfig } from "../src/lib/config.ts";
+import { scaffoldLibrary } from "../src/lib/scaffold.ts";
 
 interface ScriptedCtx {
 	mode: string;
@@ -300,6 +302,52 @@ test("linkFlow non-interactive: malformed repo must fail loudly, never silently 
 		// The user's file must be untouched, no scaffold committed.
 		assert.ok(existsSync(join(libDir, "some-file.txt")));
 		assert.equal(existsSync(join(libDir, "MANIFEST.md")), false);
+	} finally {
+		sandbox.cleanup();
+	}
+});
+
+test("cloneFlow finish persists the explicit remote URL in repo", async () => {
+	const sandbox = createSandbox("pi-sop-clone-repo-");
+	const source = join(sandbox.root, "source-library");
+	const target = join(sandbox.root, "machine-lib");
+	mkdirSync(sandbox.home, { recursive: true });
+	process.env.PI_SOP_DIR = target;
+	try {
+		await scaffoldLibrary(source);
+		writeConfig({ repo: "old-machine-remote" });
+		const ctx = scriptedCtx({ mode: "print" });
+		ctx.hasUI = false;
+
+		await cloneFlow(source, ctx as never);
+
+		assert.equal(readConfig().repo, source, "finish must use the cloned repository's origin over stale config");
+		assert.equal(readConfig().libDir, target);
+		assert.ok(readConfig().initializedAt);
+		assert.equal(ctx.reloaded, true);
+	} finally {
+		sandbox.cleanup();
+	}
+});
+
+test("status panel configureRemote writes the selected URL into repo", async () => {
+	const sandbox = createSandbox("pi-sop-configure-repo-");
+	const libDir = join(sandbox.root, "library");
+	const remote = join(sandbox.root, "remote.git");
+	process.env.PI_SOP_DIR = libDir;
+	mkdirSync(sandbox.home, { recursive: true });
+	try {
+		await scaffoldLibrary(libDir);
+		mkdirSync(remote);
+		execFileSync("git", ["init", "--bare", "-q", "-b", "main", remote], { cwd: sandbox.root });
+		writeConfig({ repo: null });
+		const ctx = scriptedCtx({ selects: ["配置远端"], inputs: [remote] });
+
+		await _runInit({ mode: "wizard" }, ctx as never);
+
+		assert.equal(readConfig().repo, remote);
+		assert.ok(readFileSync(join(libDir, ".git", "config"), "utf8").includes(`url = ${remote}`));
+		assert.ok(ctx.notifications.some((message) => message.includes("远端已配置")));
 	} finally {
 		sandbox.cleanup();
 	}

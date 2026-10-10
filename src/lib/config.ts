@@ -5,14 +5,15 @@
  *
  * Path resolution order (computed on every call, never cached):
  *   1. env PI_SOP_DIR                      (explicit override: tests / multiple libraries)
- *   2. config libDir                       (written by /sop init)
- *   3. ~/sop-library                       (convention default)
+ *   2. existing config libDir              (written by /sop init; stale paths are bypassed)
+ *   3. ~/sop-library                       (convention default; may offer autoClone)
  *
  * The config lives in the agent dir (machine-private) and is deliberately
  * never written inside the SOP library (that repo is shared across machines).
  */
 
 import {
+	lstatSync,
 	mkdirSync,
 	readFileSync,
 	renameSync,
@@ -44,6 +45,8 @@ export interface PiSopConfig {
 	enabled: boolean;
 	/** Path of the SOP library chosen by /sop init. */
 	libDir: string | null;
+	/** Machine-independent Git remote used to clone the SOP library on new machines. */
+	repo: string | null;
 	/** Whether sop_save may silently create a local-only library. */
 	autoInit: boolean;
 	/** ISO timestamp of the first successful init. */
@@ -56,6 +59,7 @@ export const DEFAULT_CONFIG: PiSopConfig = {
 	version: CONFIG_VERSION,
 	enabled: true,
 	libDir: null,
+	repo: null,
 	autoInit: true,
 	initializedAt: null,
 	lastSyncAt: null,
@@ -66,6 +70,10 @@ export type LibDirSource = "env" | "config" | "default";
 export interface ResolvedLibDir {
 	dir: string;
 	source: LibDirSource;
+	/** A configured machine-specific path that does not exist on this machine. */
+	stale?: string;
+	/** Candidate to clone when the default path is missing and a repo is configured. */
+	autoClone?: { repo: string; target: string };
 }
 
 /** Expand a leading `~` (and `~/`) to the home directory. */
@@ -122,6 +130,7 @@ export function readConfig(): PiSopConfig {
 		version: typeof parsed.version === "number" ? parsed.version : CONFIG_VERSION,
 		enabled: readBool(parsed.enabled, DEFAULT_CONFIG.enabled),
 		libDir: readString(parsed.libDir) ? resolve(expandHome(readString(parsed.libDir) as string)) : null,
+		repo: readString(parsed.repo),
 		autoInit: readBool(parsed.autoInit, DEFAULT_CONFIG.autoInit),
 		initializedAt: readString(parsed.initializedAt),
 		lastSyncAt: readString(parsed.lastSyncAt),
@@ -179,6 +188,15 @@ function isDirectory(path: string): boolean {
 	}
 }
 
+function pathExists(path: string): boolean {
+	try {
+		lstatSync(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Resolve the library directory. `explicit` (e.g. `/sop init --link <path>`)
  * short-circuits the three-level lookup.
@@ -191,11 +209,23 @@ export function resolveLibDir(explicit?: string | null): ResolvedLibDir {
 	if (fromEnv && fromEnv.trim()) {
 		return { dir: normalizeDir(fromEnv), source: "env" };
 	}
-	const configured = readConfig().libDir;
-	if (configured) {
-		return { dir: configured, source: "config" };
+	const config = readConfig();
+	let stale: string | undefined;
+	if (config.libDir) {
+		if (isDirectory(config.libDir)) return { dir: config.libDir, source: "config" };
+		stale = config.libDir;
 	}
-	return { dir: defaultLibDir(), source: "default" };
+
+	const target = defaultLibDir();
+	if (isDirectory(target)) {
+		return { dir: target, source: "default", ...(stale ? { stale } : {}) };
+	}
+	return {
+		dir: target,
+		source: "default",
+		...(stale ? { stale } : {}),
+		...(!pathExists(target) && config.repo ? { autoClone: { repo: config.repo, target } } : {}),
+	};
 }
 
 /** True when `dir` exists and is a directory. */

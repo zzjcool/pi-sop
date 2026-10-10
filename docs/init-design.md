@@ -331,3 +331,25 @@ pi 启动看是否都被识别为 skill
 已知边界（记录在案，非缺陷）：
 1. 非 git 目录的库（手工搭建未经 /sop init）不服务 skill——probe 状态机要求 repo，这是刻意的（库必须可同步）
 2. skill 同名时 pi 静默先注册者胜出——pi-sop 以「写入前拒绝」防御，但用户手写文件可绕过，故 session_start 有冲突扫描告警
+
+---
+
+## 附录 C：机器无关远端配置与会话启动自动克隆（v0.4）
+
+### C.1 配置 schema
+
+`~/.pi/agent/pi-sop.json` 增加 `repo: string | null`，保存 SOP 库的 git 远端地址；`libDir` 仍是本机路径，不写进库仓库。schema version 保持 1：缺少 `repo` 的 v1 配置按 `null` 读取，新增字段为纯增量。
+
+### C.2 路径解析与恢复
+
+解析顺序为显式参数、`PI_SOP_DIR`、本机存在的 config `libDir`、默认 `~/sop-library`。环境变量始终生效且不触发克隆；不存在的 config `libDir` 作为 `stale` 展示并被绕过。默认路径不存在且 `repo` 非空时，解析器返回 `autoClone: { repo, target }` 候选。存在的路径优先；空目录不视作 missing，因此交给显式 `/sop init` 处理，不自动触碰。
+
+`session_start` 对缺失默认库只启动一次后台 `clone()`（30 秒上限），不等待、不弹窗、不 scaffold。克隆后重新 probe：usable 库按成功写回 `libDir`、`repo`、`initializedAt` 与 `lastSyncAt`；并发克隆竞态允许以 post-probe usable 判定成功。malformed 仓库只警告并提示用户手动 `/sop init` 补骨架；失败提示可在下次进程启动后重试。此自动路径严格不覆盖已存在或空目录。
+
+### C.3 远端回填与状态
+
+session_start 遇到 usable 库且探测到 origin 时，将空的 config `repo` 回填为 origin。`/sop init` 的 `finish()` 同样从最终 probe 取远端并写入配置；状态面板配置远端成功后即时写回 `repo`。状态输出展示远端仓库设置，并对跨机器失效的 `libDir` 展示回退提示。缺失库告警不再受旧 `initializedAt` 抑制；有自动克隆候选时由克隆结果通知接管。
+
+### C.4 冻结安全规则
+
+保持 session_start 永不阻塞、不弹窗，自动克隆 fire-and-forget；只在 resolved state 为 missing 时启动，不覆盖任何已有文件；不在后台 scaffold。配置仍只写入 agent 配置目录，不写入 SOP 库。

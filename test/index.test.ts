@@ -13,7 +13,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -182,6 +182,14 @@ function toolText(result: ToolResult): string {
 	return result.content.map((c) => c.text).join("\n");
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for the background operation");
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+	}
+}
+
 test("resources_discover exposes nothing when the library is missing", async () => {
 	await withExtension(async ({ api, libDir }) => {
 		const handler = handlerFor(api, "resources_discover");
@@ -224,7 +232,232 @@ test("session_start never prompts and notifies once when uninitialized", async (
 
 		const messages = notifies.messages.map((m) => m.text);
 		assert.equal(messages.length, 1, "exactly one notify per process");
-		assert.match(messages[0] ?? "", /SOP 库未初始化/);
+		assert.match(messages[0] ?? "", /库路径 .* 在本机不存在/);
+		assert.match(messages[0] ?? "", /init --clone <url>/);
+	});
+});
+
+test("session_start reports a missing library even when initializedAt was already set", async () => {
+	await withSandbox(async (sandbox) => {
+		resetNotifyFlag();
+		const stale = join(sandbox.root, "from-another-machine");
+		writeConfig({ libDir: stale, initializedAt: "2024-01-02T03:04:05.000Z" });
+		const api = createFakePi();
+		loadExtension(api);
+		const notifies: FakeNotifies = { messages: [] };
+
+		const handler = handlerFor(api, "session_start");
+		await handler({ reason: "startup" }, createCtx({ notifies }));
+		await handler({ reason: "resume" }, createCtx({ notifies }));
+		await handler({ reason: "fork" }, createCtx({ notifies }));
+
+		assert.equal(notifies.messages.length, 1, "the old initializedAt must not silence the missing-library notice and notice is once per process");
+		assert.match(notifies.messages[0]?.text ?? "", /本机不存在/);
+		assert.ok(notifies.messages[0]?.text.includes(stale));
+		assert.match(notifies.messages[0]?.text ?? "", /来自其他机器/);
+		assert.match(notifies.messages[0]?.text ?? "", /init --clone <url>/);
+	});
+});
+
+test("session_start backfills repo from a usable library origin", async () => {
+	await withExtension(async ({ api, libDir, root }) => {
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(libDir, { commit: false });
+		const origin = join(root, "origin.git");
+		execFileSync("git", ["init", "--bare", "-q", "-b", "main", origin]);
+		runGit(libDir, ["remote", "add", "origin", origin]);
+		writeConfig({ repo: null });
+
+		await handlerFor(api, "session_start")({ reason: "startup" }, createCtx());
+
+		assert.equal(readConfig().repo, origin);
+	});
+});
+
+test("session_start automatically clones a configured repo in the background", async () => {
+	await withSandbox(async (sandbox) => {
+		resetNotifyFlag();
+		const source = join(sandbox.root, "source-library");
+		mkdirSync(sandbox.home, { recursive: true });
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(source);
+		writeConfig({ repo: source });
+
+		const realGit = process.env.PATH?.split(":").map((path) => join(path, "git")).find(existsSync);
+		assert.ok(realGit, "git executable must be present on PATH");
+		const bin = join(sandbox.root, "bin");
+		mkdirSync(bin);
+		const started = join(sandbox.root, "clone.started");
+		const release = join(sandbox.root, "clone.release");
+		const fakeGit = join(bin, "git");
+		writeFileSync(
+			fakeGit,
+			'#!/bin/sh\nif [ "$1" = "clone" ]; then\n  : > "$PI_SOP_TEST_CLONE_STARTED"\n  while [ ! -e "$PI_SOP_TEST_CLONE_RELEASE" ]; do sleep 0.01; done\nfi\nexec "$PI_SOP_TEST_REAL_GIT" "$@"\n',
+		);
+		chmodSync(fakeGit, 0o755);
+		const previousPath = process.env.PATH;
+		const previousRealGit = process.env.PI_SOP_TEST_REAL_GIT;
+		const previousStarted = process.env.PI_SOP_TEST_CLONE_STARTED;
+		const previousRelease = process.env.PI_SOP_TEST_CLONE_RELEASE;
+		process.env.PATH = `${bin}:${previousPath ?? ""}`;
+		process.env.PI_SOP_TEST_REAL_GIT = realGit;
+		process.env.PI_SOP_TEST_CLONE_STARTED = started;
+		process.env.PI_SOP_TEST_CLONE_RELEASE = release;
+		let handlerReturned = false;
+		let handlerPromise: Promise<unknown> | undefined;
+		try {
+			const api = createFakePi();
+			loadExtension(api);
+			const notifies: FakeNotifies = { messages: [] };
+			handlerPromise = Promise.resolve(
+				handlerFor(api, "session_start")({ reason: "startup" }, createCtx({ notifies })),
+			).then(() => {
+				handlerReturned = true;
+			});
+			await waitFor(() => existsSync(started));
+			const returnedBeforeCloneFinished = handlerReturned;
+			assert.equal(notifies.messages.length, 0, "clone has not finished or notified yet");
+			writeFileSync(release, "");
+			await handlerPromise;
+			assert.equal(returnedBeforeCloneFinished, true, "session_start must not await git clone");
+			await waitFor(() => notifies.messages.length > 0);
+
+			const target = join(sandbox.home, "sop-library");
+			assert.match(notifies.messages[0]?.text ?? "", /本机没有 SOP 库/);
+			assert.match(notifies.messages[0]?.text ?? "", /自动从 .* 克隆到/);
+			assert.match(notifies.messages[0]?.text ?? "", /个 SOP/);
+			assert.equal(readConfig().libDir, target);
+			assert.equal(readConfig().repo, source);
+			assert.ok(readConfig().initializedAt);
+			assert.ok(readConfig().lastSyncAt);
+			assert.equal(probeLibrary(target).state, "ready");
+		} finally {
+			if (!existsSync(release)) writeFileSync(release, "");
+			await handlerPromise?.catch(() => {});
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			if (previousRealGit === undefined) delete process.env.PI_SOP_TEST_REAL_GIT;
+			else process.env.PI_SOP_TEST_REAL_GIT = previousRealGit;
+			if (previousStarted === undefined) delete process.env.PI_SOP_TEST_CLONE_STARTED;
+			else process.env.PI_SOP_TEST_CLONE_STARTED = previousStarted;
+			if (previousRelease === undefined) delete process.env.PI_SOP_TEST_CLONE_RELEASE;
+			else process.env.PI_SOP_TEST_CLONE_RELEASE = previousRelease;
+		}
+	});
+});
+
+test("session_start reports automatic clone failure once per process", async () => {
+	await withSandbox(async (sandbox) => {
+		resetNotifyFlag();
+		mkdirSync(sandbox.home, { recursive: true });
+		const missingRemote = join(sandbox.root, "missing-remote.git");
+		writeConfig({ repo: missingRemote });
+		const api = createFakePi();
+		loadExtension(api);
+		const notifies: FakeNotifies = { messages: [] };
+		const handler = handlerFor(api, "session_start");
+
+		await handler({ reason: "startup" }, createCtx({ notifies }));
+		await handler({ reason: "resume" }, createCtx({ notifies }));
+		await waitFor(() => notifies.messages.length > 0);
+
+		assert.equal(notifies.messages.length, 1);
+		assert.match(notifies.messages[0]?.text ?? "", /自动克隆失败/);
+		assert.ok(notifies.messages[0]?.text.includes(missingRemote), "failure notice includes the clone error's first line");
+		assert.match(notifies.messages[0]?.text ?? "", /网络恢复后重启会话会自动重试/);
+		assert.equal(readConfig().initializedAt, null);
+	});
+});
+
+test("session_start does not scaffold a successfully cloned malformed repo", async () => {
+	await withSandbox(async (sandbox) => {
+		resetNotifyFlag();
+		mkdirSync(sandbox.home, { recursive: true });
+		const source = makeRepo(sandbox.root, "malformed-source");
+		writeFileSync(join(source, "README.md"), "not an SOP library\\n");
+		runGit(source, ["add", "README.md"]);
+		runGit(source, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "malformed source"]);
+		writeConfig({ repo: source });
+		const api = createFakePi();
+		loadExtension(api);
+		const notifies: FakeNotifies = { messages: [] };
+
+		await handlerFor(api, "session_start")({ reason: "startup" }, createCtx({ notifies }));
+		await waitFor(() => notifies.messages.length > 0);
+
+		const target = join(sandbox.home, "sop-library");
+		assert.equal(notifies.messages.length, 1);
+		assert.equal(notifies.messages[0]?.type, "warning");
+		assert.match(notifies.messages[0]?.text ?? "", /仓库结构不像 SOP 库/);
+		assert.match(notifies.messages[0]?.text ?? "", /运行 \/sop init 可补齐骨架/);
+		assert.equal(existsSync(join(target, "MANIFEST.md")), false);
+		assert.equal(existsSync(join(target, "sop")), false);
+		assert.equal(readConfig().initializedAt, null);
+	});
+});
+
+test("session_start treats a concurrent usable clone as success even when git clone reports failure", async () => {
+	await withSandbox(async (sandbox) => {
+		resetNotifyFlag();
+		const source = join(sandbox.root, "source-library");
+		mkdirSync(sandbox.home, { recursive: true });
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(source);
+		writeConfig({ repo: source });
+
+		const realGit = process.env.PATH?.split(":").map((path) => join(path, "git")).find(existsSync);
+		assert.ok(realGit, "git executable must be present on PATH");
+		const bin = join(sandbox.root, "bin");
+		mkdirSync(bin);
+		const fakeGit = join(bin, "git");
+		writeFileSync(
+			fakeGit,
+			'#!/bin/sh\nif [ "$1" = "clone" ]; then\n  shift\n  "$REAL_GIT" clone "$@"\n  status=$?\n  if [ "$status" -ne 0 ]; then exit "$status"; fi\n  echo "simulated concurrent clone reported failure" >&2\n  exit 1\nfi\nexec "$REAL_GIT" "$@"\n',
+		);
+		chmodSync(fakeGit, 0o755);
+		const previousPath = process.env.PATH;
+		const previousRealGit = process.env.REAL_GIT;
+		process.env.PATH = `${bin}:${previousPath ?? ""}`;
+		process.env.REAL_GIT = realGit;
+		try {
+			const api = createFakePi();
+			loadExtension(api);
+			const notifies: FakeNotifies = { messages: [] };
+
+			await handlerFor(api, "session_start")({ reason: "startup" }, createCtx({ notifies }));
+			await waitFor(() => notifies.messages.length > 0);
+
+			const target = join(sandbox.home, "sop-library");
+			assert.match(notifies.messages[0]?.text ?? "", /已自动从 .* 克隆到/);
+			assert.equal(probeLibrary(target).state, "ready");
+			assert.equal(readConfig().libDir, target);
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			if (previousRealGit === undefined) delete process.env.REAL_GIT;
+			else process.env.REAL_GIT = previousRealGit;
+		}
+	});
+});
+
+test("/sop status and /sop init status show repo and stale libDir fallback", async () => {
+	await withSandbox(async (sandbox) => {
+		const stale = join(sandbox.root, "foreign-machine-lib");
+		const repo = "git@example.com:you/sop-library.git";
+		writeConfig({ libDir: stale, repo });
+		const api = createFakePi();
+		loadExtension(api);
+		const notifies: FakeNotifies = { messages: [] };
+		const ctx = createCtx({ notifies });
+
+		await sopCommand(api).handler("status", ctx);
+		await sopCommand(api).handler("init", ctx);
+
+		assert.equal(notifies.messages.length, 3, "status plus print-status notice plus non-interactive hint");
+		for (const message of notifies.messages.slice(0, 2)) {
+			assert.ok(message.text.includes(`远端仓库: ${repo}`));
+			assert.ok(message.text.includes(`提示: 配置的 libDir ${stale} 在本机不存在`));
+		}
 	});
 });
 

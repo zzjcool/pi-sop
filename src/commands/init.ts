@@ -571,8 +571,14 @@ async function finish(dir: string, ctx: ExtensionCommandContext, _options: Finis
 		if (pull.verdict === "conflict") ctx.ui.notify(pull.message, "warning");
 	}
 
-	// 2. persist config
-	markInitialized(dir, { enabled: true, lastSyncAt: new Date().toISOString() });
+	// 2. persist config. The actual remote is authoritative after an explicit
+	// init/clone, including when a previous machine configured another URL.
+	const repo = probe.remote;
+	markInitialized(dir, {
+		enabled: true,
+		lastSyncAt: new Date().toISOString(),
+		...(repo ? { repo } : {}),
+	});
 	// A user-initiated init should also clear the throttle so the next sync is real.
 	resetSyncThrottle();
 
@@ -657,6 +663,8 @@ async function buildStatusLines(probe: ProbeResult): Promise<string> {
 	const lines = [`  路径:     ${probe.dir}`];
 	const remote = probe.remote ? `${probe.remote} (${probe.branch ?? "?"})` : "无（本地模式）";
 	lines.push(`  远端:     ${remote}`);
+	const config = readConfig();
+	lines.push(`  远端仓库: ${config.repo ?? "未配置（自动克隆不可用）"}`);
 	const { docs } = scanSopDir(probe.dir);
 	lines.push(`  SOP 数量: ${docs.length}`);
 	if (probe.gitDir) {
@@ -685,6 +693,7 @@ async function configureRemote(probe: ProbeResult, ctx: ExtensionCommandContext)
 		ctx.ui.notify(`pi-sop: 配置远端失败 — ${firstLine(added.stderr)}`, "error");
 		return;
 	}
+	writeConfig({ repo: url });
 	const pushed = await pushLibrary(probe.dir, probe.branch);
 	if (pushed.verdict === "ok") {
 		ctx.ui.notify(`pi-sop: 远端已配置并推送（${url}）`, "info");
@@ -699,12 +708,15 @@ async function configureRemote(probe: ProbeResult, ctx: ExtensionCommandContext)
 
 export async function printStatus(ctx: ExtensionCommandContext): Promise<void> {
 	const config = readConfig();
-	const dir = resolveTarget();
+	const resolved = resolveLibDir();
+	const dir = resolved.dir;
 	const probe = probeLibrary(dir);
 	const lines = [
 		`pi-sop: ${config.enabled ? "已启用" : "已禁用"}`,
 		`库路径: ${dir} (${describeState(probe)})`,
+		`远端仓库: ${config.repo ?? "未配置（自动克隆不可用）"}`,
 	];
+	if (resolved.stale) lines.push(`提示: 配置的 libDir ${resolved.stale} 在本机不存在，已改用 ${dir}`);
 	if (probe.remote) lines.push(`远端: ${probe.remote} (${probe.branch ?? "?"})`);
 	const { docs } = scanSopDir(dir);
 	lines.push(`SOP 数量: ${docs.length}`);
