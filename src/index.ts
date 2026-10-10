@@ -107,54 +107,90 @@ interface NotifyContext {
 	ui?: { notify(text: string, type?: string): void };
 }
 
+/** Delay before checking whether another process finished a concurrent clone. */
+export const AUTO_CLONE_RETRY_DELAY_MS = 1500;
+
+function cloneFailureNotice(detail: string): string {
+	return `pi-sop: 自动克隆失败（${detail || "未知错误"}）。网络恢复后重启会话会自动重试，或运行 /sop init 手动处理。`;
+}
+
+function isCloneUsable(probe: ProbeResult): boolean {
+	return probe.state === "ready" || probe.state === "no-remote";
+}
+
+function notifyMalformedClone(candidate: NonNullable<ResolvedLibDir["autoClone"]>, ctx: NotifyContext): void {
+	notifyAutoClone(
+		ctx,
+		`pi-sop: 已克隆 ${candidate.target}，但仓库结构不像 SOP 库（无 MANIFEST.md / sop/）。运行 /sop init 可补齐骨架。`,
+		"warning",
+	);
+}
+
+function markCloneInitialized(candidate: NonNullable<ResolvedLibDir["autoClone"]>, ctx: NotifyContext): void {
+	markInitialized(candidate.target, {
+		repo: candidate.repo,
+		lastSyncAt: new Date().toISOString(),
+	});
+	notifyAutoClone(
+		ctx,
+		`pi-sop: 本机没有 SOP 库，已自动从 ${candidate.repo} 克隆到 ${candidate.target}（${countSops(candidate.target)} 个 SOP）。下次会话启动时生效。`,
+		"info",
+	);
+}
+
 /** Background clone path. It never prompts and reports only through notify. */
 async function autoCloneLibrary(
 	candidate: NonNullable<ResolvedLibDir["autoClone"]>,
 	ctx: NotifyContext,
 ): Promise<void> {
-	let cloned;
+	let cloned: Awaited<ReturnType<typeof clone>>;
+	let thrownFailureNotice: string | undefined;
 	try {
 		cloned = await clone(candidate.repo, candidate.target);
 	} catch (error) {
 		const detail = error instanceof Error ? firstLine(error.message) : firstLine(String(error));
-		notifyAutoClone(
-			ctx,
-			`pi-sop: 自动克隆失败（${detail || "未知错误"}）。网络恢复后重启会话会自动重试，或运行 /sop init 手动处理。`,
-			"warning",
-		);
-		return;
+		// Keep unexpected spawn failures on the same bounded concurrent-clone
+		// recovery path as ordinary non-zero git exit codes.
+		thrownFailureNotice = cloneFailureNotice(detail);
+		cloned = {
+			ok: false,
+			code: null,
+			stdout: "",
+			stderr: detail,
+			timedOut: false,
+			command: "git clone",
+		};
 	}
 
 	const postProbe = probeLibrary(candidate.target);
 	if (cloned.ok && postProbe.state === "malformed") {
-		notifyAutoClone(
-			ctx,
-			`pi-sop: 已克隆 ${candidate.target}，但仓库结构不像 SOP 库（无 MANIFEST.md / sop/）。运行 /sop init 可补齐骨架。`,
-			"warning",
-		);
+		notifyMalformedClone(candidate, ctx);
 		return;
 	}
 
-	if (postProbe.state === "ready" || postProbe.state === "no-remote") {
-		const now = new Date().toISOString();
-		markInitialized(candidate.target, {
-			repo: candidate.repo,
-			lastSyncAt: now,
-		});
-		notifyAutoClone(
-			ctx,
-			`pi-sop: 本机没有 SOP 库，已自动从 ${candidate.repo} 克隆到 ${candidate.target}（${countSops(candidate.target)} 个 SOP）。下次会话启动时生效。`,
-			"info",
-		);
+	if (isCloneUsable(postProbe)) {
+		markCloneInitialized(candidate, ctx);
 		return;
+	}
+
+	if (!cloned.ok) {
+		// A competing process can create the target first, causing our clone to
+		// fail while that process is still checking out files. Keep session_start
+		// non-blocking and retry the local probe once after a bounded delay.
+		await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, AUTO_CLONE_RETRY_DELAY_MS));
+		const retryProbe = probeLibrary(candidate.target);
+		if (isCloneUsable(retryProbe)) {
+			markCloneInitialized(candidate, ctx);
+			return;
+		}
+		if (retryProbe.state === "malformed") {
+			notifyMalformedClone(candidate, ctx);
+			return;
+		}
 	}
 
 	const detail = firstLine(cloned.stderr) || "未知错误";
-	notifyAutoClone(
-		ctx,
-		`pi-sop: 自动克隆失败（${detail}）。网络恢复后重启会话会自动重试，或运行 /sop init 手动处理。`,
-		"warning",
-	);
+	notifyAutoClone(ctx, thrownFailureNotice ?? cloneFailureNotice(detail), "warning");
 }
 
 function notifyAutoClone(ctx: NotifyContext, message: string, type: string): void {
@@ -181,7 +217,6 @@ export default function piSop(pi: ExtensionAPI): void {
 		const { dir, probe, autoClone, stale } = resolveState();
 		if (isUsable(probe.state) && probe.remote && !config.repo) {
 			writeConfig({ repo: probe.remote });
-			config.repo = probe.remote;
 		}
 		if (isSaveable(probe.state)) {
 			// Duplicate-name guard, fs-only and best-effort: `sop_save` refuses such
@@ -225,11 +260,7 @@ export default function piSop(pi: ExtensionAPI): void {
 			attemptedAutoClone = true;
 			void autoCloneLibrary(autoClone, ctx).catch((error) => {
 				const detail = error instanceof Error ? firstLine(error.message) : firstLine(String(error));
-				notifyAutoClone(
-					ctx,
-					`pi-sop: 自动克隆失败（${detail || "未知错误"}）。网络恢复后重启会话会自动重试，或运行 /sop init 手动处理。`,
-					"warning",
-				);
+				notifyAutoClone(ctx, cloneFailureNotice(detail), "warning");
 			});
 		}
 
@@ -240,7 +271,7 @@ export default function piSop(pi: ExtensionAPI): void {
 			notifiedUninitialized = true;
 			const staleNote = stale ? `（配置里的 ${stale} 来自其他机器）` : "";
 			ctx.ui.notify(
-				`pi-sop: 库路径 ${dir} 在本机不存在${staleNote}。运行 /sop init 初始化，或运行 /sop init --clone <url> 配置自动克隆。`,
+				`pi-sop: 库路径 ${dir} 在本机不可用${staleNote}。运行 /sop init 初始化，或运行 /sop init --clone <url> 配置自动克隆。`,
 				"info",
 			);
 		}

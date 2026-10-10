@@ -117,6 +117,18 @@ test("resolveLibDir: a dead libDir falls through to the missing default and offe
 	});
 });
 
+test("resolveLibDir: a configured file is stale and falls through to the default", async () => {
+	await withSandbox((sandbox) => {
+		const stale = join(sandbox.root, "configured-file");
+		writeFileSync(stale, "not a library directory", "utf8");
+		writeConfig({ libDir: stale });
+		const resolved = resolveLibDir();
+		assert.equal(resolved.dir, join(sandbox.home, "sop-library"));
+		assert.equal(resolved.stale, stale);
+		assert.equal(resolved.source, "default");
+	});
+});
+
 test("resolveLibDir: an existing default beats a dead configured path", async () => {
 	await withSandbox((sandbox) => {
 		const stale = join(sandbox.root, "from-another-machine");

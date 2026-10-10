@@ -315,15 +315,38 @@ test("cloneFlow finish persists the explicit remote URL in repo", async () => {
 	process.env.PI_SOP_DIR = target;
 	try {
 		await scaffoldLibrary(source);
-		writeConfig({ repo: "old-machine-remote" });
+		writeConfig({ repo: null });
 		const ctx = scriptedCtx({ mode: "print" });
 		ctx.hasUI = false;
 
 		await cloneFlow(source, ctx as never);
 
-		assert.equal(readConfig().repo, source, "finish must use the cloned repository's origin over stale config");
+		assert.equal(readConfig().repo, source, "finish must fill an empty repo from the cloned repository's origin");
 		assert.equal(readConfig().libDir, target);
 		assert.ok(readConfig().initializedAt);
+		assert.equal(ctx.reloaded, true);
+	} finally {
+		sandbox.cleanup();
+	}
+});
+
+test("cloneFlow finish preserves a configured repo when the library origin differs", async () => {
+	const sandbox = createSandbox("pi-sop-clone-configured-repo-");
+	const source = join(sandbox.root, "source-library");
+	const target = join(sandbox.root, "machine-lib");
+	const configuredRepo = "git@example.com:you/fork.git";
+	mkdirSync(sandbox.home, { recursive: true });
+	process.env.PI_SOP_DIR = target;
+	try {
+		await scaffoldLibrary(source);
+		writeConfig({ repo: configuredRepo });
+		const ctx = scriptedCtx({ mode: "print" });
+		ctx.hasUI = false;
+
+		await cloneFlow(source, ctx as never);
+
+		assert.equal(readConfig().repo, configuredRepo, "finish must not replace an explicit auto-clone source with origin");
+		assert.equal(readConfig().libDir, target);
 		assert.equal(ctx.reloaded, true);
 	} finally {
 		sandbox.cleanup();

@@ -232,8 +232,29 @@ test("session_start never prompts and notifies once when uninitialized", async (
 
 		const messages = notifies.messages.map((m) => m.text);
 		assert.equal(messages.length, 1, "exactly one notify per process");
-		assert.match(messages[0] ?? "", /库路径 .* 在本机不存在/);
+		assert.match(messages[0] ?? "", /库路径 .* 在本机不可用/);
 		assert.match(messages[0] ?? "", /init --clone <url>/);
+	});
+});
+
+test("session_start reports a default library path occupied by a file as unavailable", async () => {
+	await withSandbox(async (sandbox) => {
+		resetNotifyFlag();
+		mkdirSync(sandbox.home, { recursive: true });
+		const target = join(sandbox.home, "sop-library");
+		writeFileSync(target, "keep this file", "utf8");
+		writeConfig({ repo: join(sandbox.root, "remote.git") });
+		const api = createFakePi();
+		loadExtension(api);
+		const notifies: FakeNotifies = { messages: [] };
+
+		await handlerFor(api, "session_start")({ reason: "startup" }, createCtx({ notifies }));
+
+		assert.equal(notifies.messages.length, 1);
+		assert.equal(notifies.messages[0]?.type, "info");
+		assert.match(notifies.messages[0]?.text ?? "", /库路径 .* 在本机不可用/);
+		assert.doesNotMatch(notifies.messages[0]?.text ?? "", /自动克隆失败/);
+		assert.equal(readConfig().initializedAt, null);
 	});
 });
 
@@ -252,7 +273,7 @@ test("session_start reports a missing library even when initializedAt was alread
 		await handler({ reason: "fork" }, createCtx({ notifies }));
 
 		assert.equal(notifies.messages.length, 1, "the old initializedAt must not silence the missing-library notice and notice is once per process");
-		assert.match(notifies.messages[0]?.text ?? "", /本机不存在/);
+		assert.match(notifies.messages[0]?.text ?? "", /本机不可用/);
 		assert.ok(notifies.messages[0]?.text.includes(stale));
 		assert.match(notifies.messages[0]?.text ?? "", /来自其他机器/);
 		assert.match(notifies.messages[0]?.text ?? "", /init --clone <url>/);
@@ -436,6 +457,73 @@ test("session_start treats a concurrent usable clone as success even when git cl
 			else process.env.PATH = previousPath;
 			if (previousRealGit === undefined) delete process.env.REAL_GIT;
 			else process.env.REAL_GIT = previousRealGit;
+		}
+	});
+});
+
+test("session_start retries a concurrent clone after the initial failed probe", async () => {
+	await withSandbox(async (sandbox) => {
+		resetNotifyFlag();
+		const source = join(sandbox.root, "source-library");
+		mkdirSync(sandbox.home, { recursive: true });
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(source);
+		writeConfig({ repo: source });
+
+		const realGit = process.env.PATH?.split(":").map((path) => join(path, "git")).find(existsSync);
+		assert.ok(realGit, "git executable must be present on PATH");
+		const bin = join(sandbox.root, "bin");
+		mkdirSync(bin);
+		const cloneStarted = join(sandbox.root, "concurrent-clone.started");
+		const cloneRelease = join(sandbox.root, "concurrent-clone.release");
+		const cloneFinished = join(sandbox.root, "concurrent-clone.finished");
+		const fakeGit = join(bin, "git");
+		writeFileSync(
+			fakeGit,
+			'#!/bin/sh\nif [ "$1" = "clone" ]; then\n  source="$2"\n  target="$3"\n  mkdir -p "$target"\n  : > "$PI_SOP_TEST_CONCURRENT_CLONE_STARTED"\n  ( while [ ! -e "$PI_SOP_TEST_CONCURRENT_CLONE_RELEASE" ]; do sleep 0.01; done; sleep 0.2; "$REAL_GIT" clone "$source" "$target" >/dev/null 2>&1; : > "$PI_SOP_TEST_CONCURRENT_CLONE_FINISHED" ) >/dev/null 2>&1 </dev/null &\n  echo "simulated concurrent clone is still in progress" >&2\n  exit 1\nfi\nexec "$REAL_GIT" "$@"\n',
+		);
+		chmodSync(fakeGit, 0o755);
+		const previousPath = process.env.PATH;
+		const previousRealGit = process.env.REAL_GIT;
+		const previousStarted = process.env.PI_SOP_TEST_CONCURRENT_CLONE_STARTED;
+		const previousRelease = process.env.PI_SOP_TEST_CONCURRENT_CLONE_RELEASE;
+		const previousFinished = process.env.PI_SOP_TEST_CONCURRENT_CLONE_FINISHED;
+		process.env.PATH = `${bin}:${previousPath ?? ""}`;
+		process.env.REAL_GIT = realGit;
+		process.env.PI_SOP_TEST_CONCURRENT_CLONE_STARTED = cloneStarted;
+		process.env.PI_SOP_TEST_CONCURRENT_CLONE_RELEASE = cloneRelease;
+		process.env.PI_SOP_TEST_CONCURRENT_CLONE_FINISHED = cloneFinished;
+		try {
+			const api = createFakePi();
+			loadExtension(api);
+			const notifies: FakeNotifies = { messages: [] };
+
+			await handlerFor(api, "session_start")({ reason: "startup" }, createCtx({ notifies }));
+			await waitFor(() => existsSync(cloneStarted));
+			assert.equal(probeLibrary(join(sandbox.home, "sop-library")).state, "empty-dir");
+			assert.equal(notifies.messages.length, 0, "the first failed probe must stay silent while the retry is pending");
+			writeFileSync(cloneRelease, "");
+			await waitFor(() => existsSync(cloneFinished));
+			await waitFor(() => notifies.messages.length > 0);
+
+			const target = join(sandbox.home, "sop-library");
+			assert.equal(notifies.messages.length, 1, "the transient failure must not produce a false warning");
+			assert.equal(notifies.messages[0]?.type, "info");
+			assert.match(notifies.messages[0]?.text ?? "", /已自动从 .* 克隆到/);
+			assert.doesNotMatch(notifies.messages[0]?.text ?? "", /自动克隆失败/);
+			assert.equal(probeLibrary(target).state, "ready");
+			assert.equal(readConfig().libDir, target);
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+			if (previousRealGit === undefined) delete process.env.REAL_GIT;
+			else process.env.REAL_GIT = previousRealGit;
+			if (previousStarted === undefined) delete process.env.PI_SOP_TEST_CONCURRENT_CLONE_STARTED;
+			else process.env.PI_SOP_TEST_CONCURRENT_CLONE_STARTED = previousStarted;
+			if (previousRelease === undefined) delete process.env.PI_SOP_TEST_CONCURRENT_CLONE_RELEASE;
+			else process.env.PI_SOP_TEST_CONCURRENT_CLONE_RELEASE = previousRelease;
+			if (previousFinished === undefined) delete process.env.PI_SOP_TEST_CONCURRENT_CLONE_FINISHED;
+			else process.env.PI_SOP_TEST_CONCURRENT_CLONE_FINISHED = previousFinished;
 		}
 	});
 });

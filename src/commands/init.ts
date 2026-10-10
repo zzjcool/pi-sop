@@ -571,13 +571,14 @@ async function finish(dir: string, ctx: ExtensionCommandContext, _options: Finis
 		if (pull.verdict === "conflict") ctx.ui.notify(pull.message, "warning");
 	}
 
-	// 2. persist config. The actual remote is authoritative after an explicit
-	// init/clone, including when a previous machine configured another URL.
+	// 2. Persist config. Only backfill repo when it is empty: the configured
+	// remote may intentionally differ from this clone's origin (e.g. a fork).
 	const repo = probe.remote;
+	const cfg = readConfig();
 	markInitialized(dir, {
 		enabled: true,
 		lastSyncAt: new Date().toISOString(),
-		...(repo ? { repo } : {}),
+		...(repo && !cfg.repo ? { repo } : {}),
 	});
 	// A user-initiated init should also clear the throttle so the next sync is real.
 	resetSyncThrottle();
