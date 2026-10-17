@@ -16,6 +16,7 @@ import {
 	descriptionHead,
 	findNameConflicts,
 	findSopConflicts,
+	frontmatterIssue,
 	GLOBAL_SCOPE,
 	isValidSopName,
 	listSopFiles,
@@ -145,6 +146,157 @@ test("renderSop round-trips through parseSop", () => {
 	// body survives, and the frontmatter is a valid YAML block
 	assert.match(rendered, /^---\nname: round-trip\n/);
 	assert.match(rendered, /\n---\n\n# Heading/);
+});
+
+// --- Loadability: the property that actually matters ---------------------
+//
+// A SOP that parses happily in pi-sop but not in pi is a SILENT loss: pi emits
+// no diagnostic for root-level `.md` skills, so the file stays in MANIFEST,
+// answers `/sop <keyword>`, and never reaches the agent. These tests therefore
+// assert against pi's own parser and loader, not just against parseSop.
+
+type PiFrontmatter = (content: string) => { frontmatter: Record<string, unknown> };
+
+type PiLoader = (options: { dir: string; source: string }) => {
+	skills: { name: string; description: string; filePath: string }[];
+	diagnostics: unknown[];
+};
+
+/** pi's own parser, taken from the package root (no deep import). */
+async function piApi(): Promise<{ parseFrontmatter: PiFrontmatter; loadSkillsFromDir: PiLoader }> {
+	const mod = (await import("@earendil-works/pi-coding-agent")) as unknown as {
+		parseFrontmatter: PiFrontmatter;
+		loadSkillsFromDir: PiLoader;
+	};
+	assert.equal(typeof mod.parseFrontmatter, "function", "pi must export parseFrontmatter");
+	assert.equal(typeof mod.loadSkillsFromDir, "function", "pi must export loadSkillsFromDir");
+	return mod;
+}
+
+/** Descriptions that broke pi's YAML reader in production (v0.4.0). */
+const HOSTILE_DESCRIPTIONS = [
+	"USE FOR maintaining routing (GitHub: zzjcool/home-router-proxy-kit, Release v1.0.2)",
+	"USE FOR `make run` — dropping into pi: `make run` defaults to hy4",
+	"USE FOR x | English: with a colon and a #hash and *asterisk",
+	"USE FOR trailing colon:",
+	"USE FOR a leading dash - and 'single quotes' and \"double\" quotes",
+	"USE FOR 中文描述（含 colon: 冒号）、以及 [方括号] 和 {花括号}",
+	"USE FOR value starting with a bracket [not a list]",
+];
+
+test("renderSop emits frontmatter pi's YAML reader accepts (regression: silent skill loss)", async () => {
+	const { parseFrontmatter } = await piApi();
+	for (const description of HOSTILE_DESCRIPTIONS) {
+		const rendered = renderSop({
+			name: "hostile",
+			description,
+			triggers: "a: b, c # d, [e]",
+			lastVerified: "2026-10-17",
+			body: "body",
+		});
+		// Must not throw — a throw is exactly what makes pi drop the skill.
+		const { frontmatter } = parseFrontmatter(rendered);
+		assert.equal(frontmatter.description, description, `pi must read back: ${description}`);
+		assert.equal(frontmatter.triggers, "a: b, c # d, [e]");
+		assert.equal(frontmatter.name, "hostile");
+		assert.equal(frontmatter.last_verified, "2026-10-17");
+	}
+});
+
+test("renderSop keeps each value on one line (no YAML wrapping)", () => {
+	const rendered = renderSop({
+		name: "long",
+		description: `USE FOR ${"very long prose ".repeat(40)}end`,
+		triggers: "a",
+		lastVerified: "2026-10-17",
+		body: "b",
+	});
+	const { yaml } = splitFrontmatter(rendered);
+	const lines = (yaml ?? "").split("\n").filter((line) => line.trim() !== "");
+	assert.equal(lines.length, 4, "four keys, one line each — no continuation lines");
+});
+
+// The end-to-end property: a sop/ directory written by renderSop must come out
+// of PI'S OWN loader with every file loadable as a skill.
+test("pi's loader reads every renderSop-written file in a sop/ dir (no silent drops)", async () => {
+	const { loadSkillsFromDir } = await piApi();
+	const dir = mkdtempSync(join(tmpdir(), "pi-sop-loadable-"));
+	try {
+		HOSTILE_DESCRIPTIONS.forEach((description, index) => {
+			writeFileSync(
+				join(dir, `hostile-${index}.md`),
+				renderSop({
+					name: `hostile-${index}`,
+					description,
+					triggers: "a: b",
+					lastVerified: "2026-10-17",
+					body: "body",
+				}),
+			);
+		});
+		const result = loadSkillsFromDir({ dir, source: "path" });
+		assert.equal(
+			result.skills.length,
+			HOSTILE_DESCRIPTIONS.length,
+			"pi must load every SOP (a drop here is invisible in production)",
+		);
+		// And the descriptions survive verbatim (no mangling by quoting).
+		for (let index = 0; index < HOSTILE_DESCRIPTIONS.length; index += 1) {
+			const skill = result.skills.find((entry) => entry.name === `hostile-${index}`);
+			assert.equal(skill?.description, HOSTILE_DESCRIPTIONS[index]);
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("pi's loader drops a hand-written unquoted-colon SOP — the bug this fixes", async () => {
+	const { loadSkillsFromDir } = await piApi();
+	const dir = mkdtempSync(join(tmpdir(), "pi-sop-loadable-bad-"));
+	try {
+		// Exactly the v0.4.0 shape: unquoted description with `GitHub: org/repo`.
+		writeFileSync(
+			join(dir, "broken.md"),
+			"---\nname: broken\ndescription: routing (GitHub: org/repo)\n---\n\nbody\n",
+		);
+		const result = loadSkillsFromDir({ dir, source: "path" });
+		assert.equal(result.skills.length, 0, "pi drops it silently — no skill, no diagnostic");
+		assert.equal(result.diagnostics.length, 0, "...and reports nothing at all");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("frontmatterIssue names the exact failure pi would hide", async () => {
+	// Valid + readable → no issue.
+	assert.equal(frontmatterIssue("---\nname: a\ndescription: d\n---\n"), null);
+	// The production bug: unquoted value containing `: `.
+	const broken = "---\nname: a\ndescription: routing (GitHub: org/repo)\n---\n";
+	const issue = frontmatterIssue(broken);
+	assert.ok(issue, "broken YAML must be reported");
+	assert.match(issue, /YAML/);
+	// Missing description is the other silent-skip path.
+	assert.match(frontmatterIssue("---\nname: a\n---\n") ?? "", /description/);
+	// No frontmatter at all.
+	assert.match(frontmatterIssue("# just a heading\n") ?? "", /frontmatter/);
+});
+
+// The pathological file above must be caught by readSopFile/scanSopDir rather
+// than being reported as a healthy document (pre-v0.5 behavior).
+test("scanSopDir reports YAML-invalid frontmatter as an issue and omits the doc", async () => {
+	const { parseFrontmatter } = await piApi();
+	withSopDir((dir) => {
+		const broken = "---\nname: broken\ndescription: routing (GitHub: org/repo)\n---\n\nbody\n";
+		writeFileSync(join(dir, "sop", "broken.md"), broken);
+		writeFileSync(join(dir, "sop", "fine.md"), "---\nname: fine\ndescription: d\n---\n");
+		// Sanity: this is genuinely invalid for pi.
+		assert.throws(() => parseFrontmatter(broken));
+
+		const result = scanSopDir(dir);
+		assert.deepEqual(result.docs.map((doc) => doc.name), ["fine"]);
+		assert.equal(result.issues.length, 1);
+		assert.equal(result.issues[0]?.filePath, join(dir, "sop", "broken.md"));
+	});
 });
 
 test("scanSopDir collects docs, sorted, and ignores non-markdown + dotfiles", () => {

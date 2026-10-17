@@ -82,12 +82,15 @@ let attemptedAutoClone = false;
 
 /** Conflict signatures already warned about in this process. */
 const reportedConflicts = new Set<string>();
+/** Unloadable-file signatures already warned about in this process. */
+const reportedUnloadable = new Set<string>();
 
 /** Test seam: allow re-notifying in a fresh process-like context. */
 export function resetNotifyFlag(): void {
 	notifiedUninitialized = false;
 	attemptedAutoClone = false;
 	reportedConflicts.clear();
+	reportedUnloadable.clear();
 }
 
 /** ------------------------------------------------------------------ */
@@ -220,6 +223,10 @@ export default function piSop(pi: ExtensionAPI): void {
 			// writes, but a hand-written file can still collide, and pi silently
 			// drops the loser skill (first registration wins). Never prompts.
 			warnOnConflicts(dir, ctx);
+			// Same class of silent loss, different cause: frontmatter pi's YAML
+			// reader rejects. pi emits no diagnostic for root `.md` skills, so
+			// without this check the SOP just never appears in the prompt.
+			warnOnUnloadable(dir, ctx);
 		}
 		if (probe.state === "ready") {
 			// Fire and forget: the sync has its own timeout and throttle, and
@@ -426,6 +433,48 @@ function warnOnConflicts(dir: string, ctx: { ui?: { notify(text: string, type?: 
 	}
 	if (conflicts.length > 5) lines.push(`…另有 ${conflicts.length - 5} 组`);
 	lines.push("请重命名其中之一（如加项目前缀）。");
+	try {
+		ctx?.ui?.notify(lines.join("\n"), "warning");
+	} catch {
+		// Stale ctx after reload/session switch — nothing to do.
+	}
+}
+
+/** ------------------------------------------------------------------ */
+/** session_start load-health warning (fs-only, best-effort)              */
+/** ------------------------------------------------------------------ */
+
+/**
+ * Warn once per (process, broken-set) about SOP files pi cannot load.
+ *
+ * Duplicate names are only one way a skill disappears. The other — the one that
+ * bit v0.4.0 in production — is frontmatter that pi's YAML reader rejects, e.g.
+ * an unquoted description containing `GitHub: org/repo`. pi reports nothing for
+ * root `.md` skills, so the SOP sits in MANIFEST, answers `/sop <keyword>`, and
+ * still never reaches the agent. `renderSop` no longer emits such files, but
+ * hand-written or historically-committed ones need surfacing.
+ */
+function warnOnUnloadable(dir: string, ctx: { ui?: { notify(text: string, type?: string): void } }): void {
+	let issues;
+	try {
+		issues = scanSopDir(dir).issues;
+	} catch {
+		return; // never let a scan failure touch session start
+	}
+	if (issues.length === 0) return;
+	const signature = issues.map((issue) => `${issue.filePath}:${issue.message}`).join("|");
+	if (reportedUnloadable.has(signature)) return;
+	reportedUnloadable.add(signature);
+
+	const lines = [
+		`pi-sop: ${issues.length} 条 SOP 无法被 pi 加载为 skill（会静默缺席，MANIFEST 里却看着正常）：`,
+	];
+	for (const issue of issues.slice(0, 5)) {
+		lines.push(`• ${issue.filePath}`);
+		lines.push(`  ${issue.message}`);
+	}
+	if (issues.length > 5) lines.push(`…另有 ${issues.length - 5} 条`);
+	lines.push("修好后运行 /sop sync 同步到其他机器。");
 	try {
 		ctx?.ui?.notify(lines.join("\n"), "warning");
 	} catch {
@@ -649,8 +698,14 @@ async function commandStatus(ctx: ExtensionCommandContext): Promise<void> {
 	if (stale) lines.push(`提示: 配置的 libDir ${stale} 在本机不可用，已改用 ${dir}`);
 	if (probe.remote) lines.push(`远端:   ${probe.remote} (${probe.branch ?? "?"})`);
 	if (isUsable(probe.state)) {
-		const { docs } = scanSopDir(dir);
+		const { docs, issues } = scanSopDir(dir);
 		lines.push(`SOP 数量: ${countSops(dir)}`);
+		if (issues.length > 0) {
+			// The library looks healthy by count yet pi silently drops these.
+			lines.push(`⚠ 无法加载: ${issues.length} 条（frontmatter 不合法，pi 会跳过）`);
+			for (const issue of issues.slice(0, 3)) lines.push(`  ${issue.filePath}`);
+			if (issues.length > 3) lines.push(`  …另有 ${issues.length - 3} 条`);
+		}
 		const projectScopes = new Set(docs.filter((doc) => doc.scope !== GLOBAL_SCOPE).map((doc) => doc.scope));
 		if (projectScopes.size > 0) {
 			lines.push(`项目专属: ${projectScopes.size} 个项目目录`);

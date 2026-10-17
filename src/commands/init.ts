@@ -666,8 +666,9 @@ async function buildStatusLines(probe: ProbeResult): Promise<string> {
 	lines.push(`  远端:     ${remote}`);
 	const config = readConfig();
 	lines.push(`  远端仓库: ${config.repo ?? "未配置（自动克隆不可用）"}`);
-	const { docs } = scanSopDir(probe.dir);
+	const { docs, issues } = scanSopDir(probe.dir);
 	lines.push(`  SOP 数量: ${docs.length}`);
+	if (issues.length > 0) lines.push(`  ⚠ 无法加载: ${issues.length} 条 frontmatter 不合法（pi 会静默跳过）`);
 	if (probe.gitDir) {
 		const pending = await countUnpushed(probe.dir, probe.branch);
 		if (pending !== null) lines.push(`  待推送:   ${pending} 个本地提交`);
@@ -719,9 +720,13 @@ export async function printStatus(ctx: ExtensionCommandContext): Promise<void> {
 	];
 	if (resolved.stale) lines.push(`提示: 配置的 libDir ${resolved.stale} 在本机不可用，已改用 ${dir}`);
 	if (probe.remote) lines.push(`远端: ${probe.remote} (${probe.branch ?? "?"})`);
-	const { docs } = scanSopDir(dir);
+	const { docs, issues } = scanSopDir(dir);
 	lines.push(`SOP 数量: ${docs.length}`);
-	ctx.ui.notify(lines.join("\n"), "info");
+	if (issues.length > 0) {
+		lines.push(`⚠ 无法加载: ${issues.length} 条（frontmatter 不合法，pi 会静默跳过）`);
+		for (const issue of issues.slice(0, 3)) lines.push(`  ${issue.filePath}`);
+	}
+	ctx.ui.notify(lines.join("\n"), issues.length > 0 ? "warning" : "info");
 }
 
 function printHelp(ctx: ExtensionCommandContext): void {

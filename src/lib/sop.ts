@@ -16,6 +16,8 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+
 import { PROJECTS_DIR } from "./project.ts";
 
 export interface SopFrontmatter {
@@ -182,11 +184,47 @@ export function splitFrontmatter(content: string): { yaml: string | null; body: 
 }
 
 /**
- * Minimal scalar parser for our flat frontmatter. Only handles the keys we own:
- * `key: value` and `key: [a, b]` / comma-separated lists. Anything else is
- * treated as a string, which is exactly what `triggers` needs.
+ * Frontmatter scalars, read with PI'S OWN parser.
+ *
+ * v0.4.0 and earlier used a hand-rolled line splitter here. That let pi-sop
+ * read files pi itself rejects: an unquoted `description: ... foo: bar ...` is
+ * invalid YAML ("Nested mappings are not allowed in compact mappings"), so pi
+ * dropped the skill **silently** (root-level `.md` skills get no diagnostic)
+ * while MANIFEST/status/search still listed it as healthy.
+ *
+ * Using pi's exported `parseFrontmatter` closes that gap by construction: the
+ * reader and the loader are the same code. `yaml` is not an available module on
+ * the installed package path, so this is also the only dependency-free way to
+ * get a真 YAML grammar.
+ *
+ * Leniency applies only when the file is ALREADY unloadable: a broken file must
+ * still be readable so it can be repaired (`sop_save` / re-render), and
+ * `frontmatterIssue` is the function that decides loadability — never this one.
  */
 function parseScalars(yaml: string): Map<string, string> {
+	try {
+		const { frontmatter } = parseFrontmatter(`---\n${yaml}\n---\n`);
+		const values = new Map<string, string>();
+		for (const [rawKey, rawValue] of Object.entries(frontmatter ?? {})) {
+			if (rawValue === null || rawValue === undefined) continue;
+			const value = Array.isArray(rawValue)
+				? rawValue.map((entry) => String(entry).trim()).filter(Boolean).join(", ")
+				: String(rawValue);
+			values.set(rawKey.trim().toLowerCase(), value);
+		}
+		return values;
+	} catch {
+		return parseScalarsLenient(yaml);
+	}
+}
+
+/**
+ * Last-resort reader for frontmatter that is not valid YAML.
+ *
+ * Only used to recover the values of a file pi would skip, so the library can
+ * be repaired. Never treat a value obtained here as proof of loadability.
+ */
+function parseScalarsLenient(yaml: string): Map<string, string> {
 	const values = new Map<string, string>();
 	for (const rawLine of yaml.split("\n")) {
 		const line = rawLine.trim();
@@ -195,15 +233,67 @@ function parseScalars(yaml: string): Map<string, string> {
 		if (colon <= 0) continue;
 		const key = line.slice(0, colon).trim().toLowerCase();
 		let value = line.slice(colon + 1).trim();
-		if (value.startsWith("[") && value.endsWith("]")) {
-			value = value.slice(1, -1);
-		}
-		if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+		if (value.startsWith("[") && value.endsWith("]")) value = value.slice(1, -1);
+		if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
 			value = value.slice(1, -1);
 		}
 		if (!values.has(key)) values.set(key, value.trim());
 	}
 	return values;
+}
+
+/**
+ * Serialize one frontmatter value so pi's parser reads it back verbatim.
+ *
+ * Strategy is verify-then-quote rather than a rule table: emit the raw value,
+ * ask pi's parser what it thinks, and fall back to a JSON string literal (valid
+ * YAML double-quoted scalar) when the result is not an exact match. A rule
+ * table cannot be trusted here — YAML's plain-scalar restrictions are
+ * positional (`: ` breaks mid-value, `#` only after a space, `[` only at the
+ * start, ...), and getting one case wrong means a silently unloadable SOP.
+ *
+ * `lineWidth`-style wrapping is avoided by construction: the JSON fallback is
+ * a single physical line, and a plain value that parses back unchanged cannot
+ * have been wrapped (wrapping inserts a line break into the value).
+ */
+function encodeScalar(value: string): string {
+	const trial = `---\nkey: ${value}\n---\n`;
+	try {
+		const { frontmatter } = parseFrontmatter(trial);
+		if (frontmatter.key === value) return value;
+	} catch {
+		// fall through to the quoted form
+	}
+	// JSON strings are valid YAML double-quoted scalars (\\, \", \n, \t all
+	// mean the same thing), so this is always parseable and always exact.
+	return JSON.stringify(value);
+}
+
+/**
+ * Why pi cannot load this document as a skill, or `null` when it can.
+ *
+ * Mirrors pi's loader contract for root `.md` skills: the frontmatter must
+ * parse as YAML and carry a non-empty `description`. Anything else means the
+ * SOP exists on disk but is invisible to the agent.
+ */
+export function frontmatterIssue(content: string): string | null {
+	const { yaml } = splitFrontmatter(content);
+	if (yaml === null) return "缺少 frontmatter（不会被 pi 识别为 skill）";
+	let frontmatter: Record<string, unknown>;
+	try {
+		({ frontmatter } = parseFrontmatter(content));
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return `frontmatter 不是合法 YAML，pi 会静默跳过这条 skill：${message.split("\n")[0]}`;
+	}
+	if (!frontmatter || Object.keys(frontmatter).length === 0) {
+		return "frontmatter 为空（不会被 pi 识别为 skill）";
+	}
+	const description = frontmatter.description;
+	if (typeof description !== "string" || description.trim() === "") {
+		return "缺少 description（不会被 pi 识别为 skill）";
+	}
+	return null;
 }
 
 export function parseSop(content: string, slug: string): SopFrontmatter {
@@ -223,7 +313,17 @@ export function parseSop(content: string, slug: string): SopFrontmatter {
 	};
 }
 
-/** Serialize an SOP document (frontmatter + body). */
+/**
+ * Serialize an SOP document (frontmatter + body).
+ *
+ * Every value passes through `encodeScalar`, which is verified against pi's own
+ * parser instead of guessed. A description is free prose written by an agent, so
+ * it routinely contains `GitHub: org/repo`, `pi: make run`, or a `#` — all of
+ * which break the unquoted `key: value` form and made pi drop the skill
+ * silently. Those values now come out double-quoted.
+ *
+ * Key order is fixed: name, description, triggers, last_verified.
+ */
 export function renderSop(doc: {
 	name: string;
 	description: string;
@@ -232,17 +332,13 @@ export function renderSop(doc: {
 	body: string;
 }): string {
 	const body = doc.body.trim();
-	return [
-		"---",
-		`name: ${doc.name}`,
-		`description: ${doc.description}`,
-		`triggers: ${doc.triggers}`,
-		`last_verified: ${doc.lastVerified}`,
-		"---",
-		"",
-		body,
-		"",
+	const frontmatter = [
+		`name: ${encodeScalar(doc.name)}`,
+		`description: ${encodeScalar(doc.description)}`,
+		`triggers: ${encodeScalar(doc.triggers)}`,
+		`last_verified: ${encodeScalar(doc.lastVerified)}`,
 	].join("\n");
+	return ["---", frontmatter, "---", "", body, ""].join("\n");
 }
 
 /**
@@ -257,6 +353,12 @@ export function readSopFile(filePath: string, scope: string = GLOBAL_SCOPE): { d
 		return { issue: { filePath, message: error instanceof Error ? error.message : "read failed" } };
 	}
 	const slug = filePath.split(/[\\/]/).pop()?.replace(/\.md$/, "") ?? "";
+	// Report whatever makes pi skip this file — invalid YAML first, because that
+	// is the failure mode that used to be invisible here.
+	const problem = frontmatterIssue(content);
+	if (problem) {
+		return { issue: { filePath, message: problem } };
+	}
 	const frontmatter = parseSop(content, slug);
 	if (!frontmatter.description) {
 		return { issue: { filePath, message: "缺少 description（不会被 pi 识别为 skill）" } };
