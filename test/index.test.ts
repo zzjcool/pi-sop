@@ -18,8 +18,6 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
-import { loadSkills } from "@earendil-works/pi-coding-agent";
-
 import piSop, { autoCloneRetryDelay, resetNotifyFlag } from "../src/index.ts";
 import { readConfig, writeConfig } from "../src/lib/config.ts";
 import { probeLibrary } from "../src/lib/probe.ts";
@@ -172,11 +170,6 @@ function sopCommand(api: FakeApi): { handler: (args: string, ctx: unknown) => Pr
 	return command;
 }
 
-/** The sandbox agent dir, required by pi's loadSkills(). */
-function agentDirFromEnv(): string {
-	return process.env.PI_CODING_AGENT_DIR as string;
-}
-
 /** Collapse a tool result into one string for assertions. */
 function toolText(result: ToolResult): string {
 	return result.content.map((c) => c.text).join("\n");
@@ -199,15 +192,14 @@ test("resources_discover exposes nothing when the library is missing", async () 
 	});
 });
 
-test("resources_discover exposes <libDir>/sop when ready", async () => {
+test("resources_discover contributes nothing even for a ready library", async () => {
+	// SOPs are a browsable directory (sop_search + read), not a skill set: making
+	// them skills put every SOP into the system prompt on every request.
 	await withExtension(async ({ api, libDir }) => {
-		// build a ready library by hand
 		await import("../src/lib/scaffold.ts").then(({ scaffoldLibrary }) => scaffoldLibrary(libDir, { commit: false }));
 		const handler = handlerFor(api, "resources_discover");
-		const result = (await handler({ cwd: process.cwd(), reason: "startup" }, createCtx())) as {
-			skillPaths?: string[];
-		};
-		assert.deepEqual(result.skillPaths, [join(libDir, "sop")]);
+		const result = await handler({ cwd: process.cwd(), reason: "startup" }, createCtx());
+		assert.deepEqual(result, {});
 	});
 });
 
@@ -824,31 +816,19 @@ test("sop_save output message is honest in local-only mode", async () => {
 	});
 });
 
-test("the registered skillPath actually yields skills via pi's loader", async () => {
+test("the seed SOP is reachable through sop_search (the only discovery path)", async () => {
 	await withExtension(async ({ api, libDir }) => {
 		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
 		await scaffoldLibrary(libDir, { commit: false });
-		const handler = handlerFor(api, "resources_discover");
-		const result = (await handler({ cwd: process.cwd(), reason: "startup" }, createCtx())) as {
-			skillPaths?: string[];
-		};
-		const skillPath = result.skillPaths?.[0];
-		assert.ok(skillPath);
-
-		// Design §6 risk point: use pi's own loader on the exact registered path.
-		// This is the contract that must hold — if it ever stops holding, the
-		// fallback is the `sop/<name>/SKILL.md` layout.
-		const loaded = loadSkills({
-			cwd: process.cwd(),
-			agentDir: agentDirFromEnv(),
-			skillPaths: [skillPath],
-			includeDefaults: false,
-		});
-		const names = loaded.skills.map((s) => s.name);
-		assert.ok(names.includes("writing-sops"), `seed SOP must be discovered, got: ${names.join(", ")}`);
+		const result = await callTool(api, "sop_search", { query: "writing-sops" }, createCtx());
+		assert.equal(result.details.found, 1);
+		const rows = result.details.results as { name: string; path: string }[];
+		assert.equal(rows[0]!.name, "writing-sops");
+		// The path must be readable — that is the whole contract now.
+		assert.ok(existsSync(rows[0]!.path), "sop_search must return a real file path");
 	});
 });
-test("two-machine flow: A saves → B clones and discovers the SOP as a skill", async () => {
+test("two-machine flow: A saves → B clones and finds the SOP via sop_search", async () => {
 	// Machine A: init a library with a bare remote, then save a SOP.
 	const root = mkdtempSync(join(tmpdir(), "pi-sop-two-"));
 	try {
@@ -885,22 +865,13 @@ test("two-machine flow: A saves → B clones and discovers the SOP as a skill", 
 				const apiB = createFakePi();
 				loadExtension(apiB);
 
-				// B discovers the SOP that A authored, through the real loader.
-				const handler = handlerFor(apiB, "resources_discover");
-				const result = (await handler({ cwd: process.cwd(), reason: "startup" }, createCtx())) as {
-					skillPaths?: string[];
-				};
-				const skillPath = result.skillPaths?.[0];
-				assert.ok(skillPath, "B must expose the sop/ skill path");
-				const loaded = loadSkills({
-					cwd: process.cwd(),
-					agentDir: agentDirFromEnv(),
-					skillPaths: [skillPath],
-					includeDefaults: false,
-				});
-				const names = loaded.skills.map((s) => s.name);
-				assert.ok(names.includes("shared-runbook"), `B should see A's SOP, got: ${names.join(", ")}`);
-				assert.ok(names.includes("writing-sops"), "B should also see the seed SOP");
+				// B discovers the SOP that A authored, through sop_search.
+				const found = await callTool(apiB, "sop_search", { query: "shared-runbook" }, createCtx());
+				assert.equal(found.details.found, 1, "B must find A's SOP");
+				const rows = found.details.results as { name: string; path: string }[];
+				assert.equal(rows[0]!.name, "shared-runbook");
+				assert.ok(existsSync(rows[0]!.path), "the returned path must exist on B");
+				assert.match(readFileSync(rows[0]!.path, "utf8"), /1\. step/);
 			});
 		});
 	} finally {
@@ -962,7 +933,7 @@ test("sop_save refuses to write into a malformed repo (no silent scaffold)", asy
 /** Project-scoped SOPs (projects/<normalized origin key>/)              */
 /** ------------------------------------------------------------------ */
 
-test("resources_discover puts the project dir BEFORE the global sop/ dir", async () => {
+test("a project SOP is found by sop_search with its project scope", async () => {
 	await withExtension(async ({ api, libDir, root }) => {
 		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
 		await scaffoldLibrary(libDir, { commit: false });
@@ -974,52 +945,45 @@ test("resources_discover puts the project dir BEFORE the global sop/ dir", async
 			"---\nname: tdmq-deploy\ndescription: USE FOR deploying tdmq | 用于部署 tdmq\n---\n\n1. step\n",
 		);
 
-		const handler = handlerFor(api, "resources_discover");
-		const result = (await handler(
+		const found = await callTool(api, "sop_search", { query: "tdmq-deploy" }, createCtx({ cwd: join(repo, "src") }));
+		assert.equal(found.details.found, 1);
+		const rows = found.details.results as { name: string; scope: string; path: string }[];
+		assert.equal(rows[0]!.name, "tdmq-deploy");
+		assert.equal(rows[0]!.scope, TDMQ_KEY, "scope tells the model which project this belongs to");
+		assert.ok(existsSync(rows[0]!.path));
+		// And no skill paths are exposed for it.
+		const discover = await handlerFor(api, "resources_discover")(
 			{ cwd: join(repo, "src"), reason: "startup" },
 			createCtx({ cwd: join(repo, "src") }),
-		)) as { skillPaths?: string[] };
-
-		// Project first: pi keeps the first registration for a duplicate name.
-		assert.deepEqual(result.skillPaths, [projectDir, join(libDir, "sop")]);
-
-		// …and pi's own loader really discovers the project SOP through it.
-		const loaded = loadSkills({
-			cwd: process.cwd(),
-			agentDir: agentDirFromEnv(),
-			skillPaths: result.skillPaths ?? [],
-			includeDefaults: false,
-		});
-		const names = loaded.skills.map((s) => s.name);
-		assert.ok(names.includes("tdmq-deploy"), `project SOP must load, got: ${names.join(", ")}`);
-		assert.ok(names.includes("writing-sops"), "global SOP must still load");
+		);
+		assert.deepEqual(discover, {});
 	});
 });
 
-test("resources_discover ignores a project dir that does not exist yet", async () => {
+test("resources_discover stays empty when a project dir does not exist yet", async () => {
 	await withExtension(async ({ api, libDir, root }) => {
 		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
 		await scaffoldLibrary(libDir, { commit: false });
 		const repo = makeRepo(root, "work/repo", TDMQ_ORIGIN);
-		const result = (await handlerFor(api, "resources_discover")(
+		const result = await handlerFor(api, "resources_discover")(
 			{ cwd: repo, reason: "startup" },
 			createCtx({ cwd: repo }),
-		)) as { skillPaths?: string[] };
-		assert.deepEqual(result.skillPaths, [join(libDir, "sop")]);
+		);
+		assert.deepEqual(result, {});
 	});
 });
 
-test("resources_discover is unchanged for a cwd outside any git repo", async () => {
+test("resources_discover stays empty for a cwd outside any git repo", async () => {
 	await withExtension(async ({ api, libDir, root }) => {
 		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
 		await scaffoldLibrary(libDir, { commit: false });
 		const plain = join(root, "not-a-repo");
 		mkdirSync(plain, { recursive: true });
-		const result = (await handlerFor(api, "resources_discover")(
+		const result = await handlerFor(api, "resources_discover")(
 			{ cwd: plain, reason: "startup" },
 			createCtx({ cwd: plain }),
-		)) as { skillPaths?: string[] };
-		assert.deepEqual(result.skillPaths, [join(libDir, "sop")]);
+		);
+		assert.deepEqual(result, {});
 	});
 });
 
@@ -1115,7 +1079,7 @@ test("sop_save project:true inside a submodule writes under the submodule key", 
 	});
 });
 
-test("resources_discover injects BOTH submodule and parent project dirs (submodule first)", async () => {
+test("nested submodule + parent scopes are both resolvable by sop_search", async () => {
 	await withExtension(async ({ api, libDir, root }) => {
 		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
 		await scaffoldLibrary(libDir, { commit: false });
@@ -1136,11 +1100,11 @@ test("resources_discover injects BOTH submodule and parent project dirs (submodu
 		mkdirSync(subDir, { recursive: true });
 		mkdirSync(parentDir, { recursive: true });
 
-		const result = (await handlerFor(api, "resources_discover")(
+		const result = await handlerFor(api, "resources_discover")(
 			{ cwd: join(child, "src"), reason: "startup" },
 			createCtx({ cwd: join(child, "src") }),
-		)) as { skillPaths?: string[] };
-		assert.deepEqual(result.skillPaths, [subDir, parentDir, join(libDir, "sop")]);
+		);
+		assert.deepEqual(result, {}, "no skill paths even with submodule + parent scopes");
 	});
 });
 
@@ -1363,23 +1327,25 @@ test("session_start stays silent when there are no duplicates", async () => {
 	});
 });
 
-test("a library whose only SOP is project-scoped still serves it as a skill path", async () => {
+test("a library with only project SOPs is still usable and searchable", async () => {
 	await withExtension(async ({ api, libDir, root }) => {
 		// No global sop/ dir at all: probe must say ready (projects/ is legal
-		// structure) and resources_discover must still hand out a path.
+		// structure), and the SOP must still be reachable via sop_search.
 		mkdirSync(libDir, { recursive: true });
 		runGit(libDir, ["init", "-q", "-b", "main"]);
 		const repo = makeRepo(root, "work/repo", TDMQ_ORIGIN);
 		const projectDir = join(libDir, "projects", TDMQ_KEY);
 		mkdirSync(projectDir, { recursive: true });
-		writeFileSync(join(projectDir, "only.md"), "---\nname: only-project\ndescription: d\n---\n");
+		writeFileSync(join(projectDir, "only.md"), "---\nname: only-project\ndescription: USE FOR the only project SOP\n---\n");
 
 		assert.equal(probeLibrary(libDir).state, "no-remote");
-		const result = (await handlerFor(api, "resources_discover")(
-			{ cwd: repo, reason: "startup" },
-			createCtx({ cwd: repo }),
-		)) as { skillPaths?: string[] };
-		assert.deepEqual(result.skillPaths, [projectDir]);
+		assert.deepEqual(
+			await handlerFor(api, "resources_discover")({ cwd: repo, reason: "startup" }, createCtx({ cwd: repo })),
+			{},
+			"project SOPs must not become skills",
+		);
+		const found = await callTool(api, "sop_search", { query: "only-project" }, createCtx({ cwd: repo }));
+		assert.equal(found.details.found, 1);
 	});
 });
 
@@ -1452,50 +1418,29 @@ test("sop_search is registered alongside sop_save", async () => {
 	});
 });
 
-test("sop_search includes hidden SOPs by default and marks them", async () => {
+test("sop_search finds EVERY SOP — nothing can be hidden from it", async () => {
+	// Since SOPs are no longer skills, `disable-model-invocation` has no meaning
+	// for them. A stale flag must not make a SOP unsearchable — that would be an
+	// unreachable file, the one outcome the directory design cannot afford.
 	await withExtension(async ({ api, libDir }) => {
 		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
 		await scaffoldLibrary(libDir, { commit: false });
 		const { renderSop } = await import("../src/lib/sop.ts");
 		writeFileSync(
-			join(libDir, "sop", "hidden-proc.md"),
+			join(libDir, "sop", "flagged-proc.md"),
 			renderSop({
-				name: "hidden-proc",
-				description: "USE FOR a hidden procedure",
-				triggers: "hiddenproc",
+				name: "flagged-proc",
+				description: "USE FOR a procedure with a stale flag",
+				triggers: "flaggedproc",
 				lastVerified: "2026-10-17",
 				body: "steps",
 				extra: { "disable-model-invocation": "true" },
 			}),
 		);
-		// The library must be re-probed from a usable state.
-		const result = await callTool(api, "sop_search", { query: "hiddenproc" }, createCtx());
-		assert.match(result.content[0]!.text, /hidden-proc/);
-		assert.match(result.content[0]!.text, /\[已隐藏\]/);
-		const rows = result.details.results as { name: string; hidden: boolean }[];
-		assert.equal(rows.length, 1);
-		assert.equal(rows[0]!.hidden, true);
-	});
-});
-
-test("sop_search can exclude hidden SOPs on request", async () => {
-	await withExtension(async ({ api, libDir }) => {
-		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
-		await scaffoldLibrary(libDir, { commit: false });
-		const { renderSop } = await import("../src/lib/sop.ts");
-		writeFileSync(
-			join(libDir, "sop", "hidden-proc.md"),
-			renderSop({
-				name: "hidden-proc",
-				description: "USE FOR a hidden procedure",
-				triggers: "hiddenproc",
-				lastVerified: "2026-10-17",
-				body: "steps",
-				extra: { "disable-model-invocation": "true" },
-			}),
-		);
-		const result = await callTool(api, "sop_search", { query: "hiddenproc", include_hidden: false }, createCtx());
-		assert.equal(result.details.found, 0);
+		const result = await callTool(api, "sop_search", { query: "flaggedproc" }, createCtx());
+		assert.equal(result.details.found, 1);
+		const rows = result.details.results as { name: string }[];
+		assert.equal(rows[0]!.name, "flagged-proc");
 	});
 });
 
@@ -1557,122 +1502,68 @@ test("sop_save preserves disable-model-invocation across an update", async () =>
 // constant as the library grows, and no SOP becomes unreachable.
 
 /** Build a `before_agent_start` event carrying the given skills. */
-function agentStartEvent(skills: { name: string; description: string; filePath: string; baseDir: string }[]) {
-	return {
-		type: "before_agent_start",
-		messageType: "user",
-		prompt: "hi",
-		systemPromptOptions: {
-			skills: skills.map((skill) => ({
-				...skill,
-				sourceInfo: { path: skill.filePath, source: "local", scope: "user", origin: "top-level" },
-				disableModelInvocation: false,
-			})),
-		},
-	};
-}
-
-function writeSop(libDir: string, dirName: string, name: string, description: string): void {
-	const { renderSop } = { renderSop: (d: Record<string, string>) => {
-		const lines = ["---", `name: ${d.name}`, `description: ${d.description}`, "triggers: t", "last_verified: 2026-10-17", "---", "", "body"];
-		return lines.join("\n");
-	} };
-	writeFileSync(join(libDir, dirName, `${name}.md`), renderSop({ name, description, triggers: "t", lastVerified: "2026-10-17", body: "body" }));
-}
-
-test("index mode replaces every SOP skill with one entry", async () => {
+test("resources_discover registers no skill paths at all", async () => {
+	// SOPs are a DIRECTORY the model browses with sop_search + read, not a skill
+	// set. Registering them as skills put every SOP's name+description+location
+	// into the system prompt on every request, so cost grew with the library.
 	await withExtension(async ({ api, libDir }) => {
 		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
 		await scaffoldLibrary(libDir, { commit: false });
-		writeConfig({ skillMode: "index" });
-		for (let i = 0; i < 5; i += 1) writeSop(libDir, "sop", `extra-${i}`, `USE FOR thing ${i}`);
+		writeFileSync(join(libDir, "sop", "some-sop.md"), "---\nname: some-sop\ndescription: d\n---\n\nbody\n");
 
-		const handler = handlerFor(api, "before_agent_start");
-		const event = agentStartEvent([
-			{ name: "writing-sops", description: "seed", filePath: join(libDir, "sop", "writing-sops.md"), baseDir: join(libDir, "sop") },
-			{ name: "extra-0", description: "x", filePath: join(libDir, "sop", "extra-0.md"), baseDir: join(libDir, "sop") },
-		]);
-		await handler(event, createCtx());
-
-		const names = (event.systemPromptOptions.skills as { name: string }[]).map((s) => s.name);
-		assert.deepEqual(names, ["sop-library"], "only the index entry survives");
+		const handler = handlerFor(api, "resources_discover");
+		const result = await handler({ cwd: process.cwd(), reason: "startup" }, createCtx());
+		assert.deepEqual(result, {}, "no skillPaths may be exposed");
 	});
 });
 
-test("index mode never strips skills from other packages", async () => {
-	await withExtension(async ({ api, libDir }) => {
+test("resources_discover registers no project SOP paths either", async () => {
+	await withExtension(async ({ api, libDir, root }) => {
 		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
 		await scaffoldLibrary(libDir, { commit: false });
-		writeConfig({ skillMode: "index" });
-		const handler = handlerFor(api, "before_agent_start");
-		const event = agentStartEvent([
-			{ name: "writing-sops", description: "seed", filePath: join(libDir, "sop", "writing-sops.md"), baseDir: join(libDir, "sop") },
-			{ name: "some-other-package-skill", description: "theirs", filePath: "/elsewhere/pkg/SKILL.md", baseDir: "/elsewhere/pkg" },
-		]);
-		await handler(event, createCtx());
-		const names = (event.systemPromptOptions.skills as { name: string }[]).map((s) => s.name);
-		assert.ok(names.includes("some-other-package-skill"), "foreign skills must be untouched");
-		assert.ok(names.includes("sop-library"));
-		assert.ok(!names.includes("writing-sops"));
+		// A project SOP that WOULD have been exposed under the old scheme.
+		const repo = makeRepo(root, "proj", TDMQ_ORIGIN);
+		const { projectDir } = await import("../src/lib/project.ts");
+		const dir = projectDir(libDir, TDMQ_KEY);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "p.md"), "---\nname: p\ndescription: d\n---\n\nbody\n");
+
+		const handler = handlerFor(api, "resources_discover");
+		const result = await handler({ cwd: repo, reason: "startup" }, createCtx({ cwd: repo }));
+		assert.deepEqual(result, {}, "project SOPs must not become skills either");
 	});
 });
 
-test("index mode description states the count and tells the model to search", async () => {
+test("the SOP library contributes ZERO skills — prompt cost is O(1)", async () => {
+	// The property that matters: adding SOPs must not grow the system prompt.
 	await withExtension(async ({ api, libDir }) => {
 		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
 		await scaffoldLibrary(libDir, { commit: false });
-		writeConfig({ skillMode: "index" });
-		const handler = handlerFor(api, "before_agent_start");
-		const event = agentStartEvent([
-			{ name: "writing-sops", description: "seed", filePath: join(libDir, "sop", "writing-sops.md"), baseDir: join(libDir, "sop") },
-		]);
-		await handler(event, createCtx());
-		const index = (event.systemPromptOptions.skills as { name: string; description: string }[]).find(
-			(s) => s.name === "sop-library",
+		for (let i = 0; i < 40; i += 1) {
+			writeFileSync(
+				join(libDir, "sop", `bulk-${i}.md`),
+				`---\nname: bulk-${i}\ndescription: USE FOR bulk thing ${i} with a fairly long description to make growth visible\ntriggers: t\nlast_verified: 2026-10-17\n---\n\nbody\n`,
+			);
+		}
+		const handler = handlerFor(api, "resources_discover");
+		const result = await handler({ cwd: process.cwd(), reason: "startup" }, createCtx());
+		assert.deepEqual(result, {}, "41 SOPs must still contribute no skill paths");
+	});
+});
+
+test("sop_search still finds SOPs that are no longer skills", async () => {
+	// The only discovery path left — if this breaks, the library is unreachable.
+	await withExtension(async ({ api, libDir }) => {
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(libDir, { commit: false });
+		writeFileSync(
+			join(libDir, "sop", "findme.md"),
+			"---\nname: findme\ndescription: USE FOR finding me\ntriggers: findme-trigger\nlast_verified: 2026-10-17\n---\n\nsteps here\n",
 		);
-		assert.ok(index);
-		// The search instruction is load-bearing: without it the model invents a
-		// plan instead of looking (verified against the deployed extension).
-		assert.match(index.description, /sop_search/);
-		assert.match(index.description, /条/);
-	});
-});
-
-test("prompt size stays flat while the library grows (the whole point)", async () => {
-	await withExtension(async ({ api, libDir }) => {
-		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
-		await scaffoldLibrary(libDir, { commit: false });
-		writeConfig({ skillMode: "index" });
-		const handler = handlerFor(api, "before_agent_start");
-		const ctx = createCtx();
-
-		const sizeWith = async (count: number) => {
-			for (let i = 0; i < count; i += 1) writeSop(libDir, "sop", `grow-${i}`, `USE FOR growing thing number ${i} with some prose`);
-			const event = agentStartEvent([]);
-			await handler(event, ctx);
-			const skills = event.systemPromptOptions.skills as { name: string; description: string }[];
-			return skills.reduce((sum, s) => sum + s.name.length + s.description.length, 0);
-		};
-
-		const small = await sizeWith(2);
-		const large = await sizeWith(20);
-		// Only the index entry is present, so growth must not scale with count.
-		// The count number itself changes ("4 条" -> "22 条"), hence a tight cap.
-		assert.ok(large - small < 50, `prompt grew by ${large - small} chars for 18 more SOPs`);
-	});
-});
-
-test("skillMode=all keeps every SOP visible (opt-out stays available)", async () => {
-	await withExtension(async ({ api, libDir }) => {
-		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
-		await scaffoldLibrary(libDir, { commit: false });
-		writeConfig({ skillMode: "all" });
-		const handler = handlerFor(api, "before_agent_start");
-		const event = agentStartEvent([
-			{ name: "writing-sops", description: "seed", filePath: join(libDir, "sop", "writing-sops.md"), baseDir: join(libDir, "sop") },
-		]);
-		await handler(event, createCtx());
-		const names = (event.systemPromptOptions.skills as { name: string }[]).map((s) => s.name);
-		assert.deepEqual(names, ["writing-sops"], "no index entry in all mode");
+		const result = await callTool(api, "sop_search", { query: "findme" }, createCtx());
+		assert.equal(result.details.found, 1);
+		const rows = result.details.results as { name: string; path: string }[];
+		assert.equal(rows[0]!.name, "findme");
+		assert.match(result.content[0]!.text, /用 read 工具打开/);
 	});
 });

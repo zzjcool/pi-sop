@@ -28,9 +28,7 @@ import {
 	readConfig,
 	resolveLibDir,
 	writeConfig,
-	INDEX_MODE_THRESHOLD,
 	type ResolvedLibDir,
-	type SkillMode,
 } from "./lib/config.ts";
 import {
 	describeState,
@@ -48,7 +46,6 @@ import {
 	findNameConflicts,
 	findSopConflicts,
 	GLOBAL_SCOPE,
-	isModelHidden,
 	countSops,
 	mostRecentVerification,
 	readSopFile,
@@ -57,9 +54,7 @@ import {
 	scanSopDir,
 	slugifySopName,
 } from "./lib/sop.ts";
-import { buildIndexSkill } from "./lib/index-skill.ts";
 import {
-	existingProjectDirs,
 	projectDir,
 	resolveProjectKeys,
 } from "./lib/project.ts";
@@ -287,73 +282,27 @@ export default function piSop(pi: ExtensionAPI): void {
 	});
 
 	// ---------------------------------------------------------------- //
-	// 2. resources_discover: register project SOPs + <libDir>/sop         //
-	// ---------------------------------------------------------------- //
-	pi.on("resources_discover", async (event, ctx) => {
-		const config = readConfig();
-		if (config.enabled === false) return {};
-		const { dir, probe } = resolveState();
-		// Only expose the skill path when the library can actually serve it.
-		if (!isUsable(probe.state)) return {};
-
-		// Project SOPs first: pi's loader keeps the FIRST skill registered under a
-		// name and silently drops later duplicates, so the more specific
-		// (project) SOP must win over a global one of the same name.
-		const cwd = event?.cwd ?? ctx?.cwd;
-		if (!cwd) {
-			// No cwd at all (should not happen in practice): project SOPs silently
-			// unavailable — leave a breadcrumb instead of a mystery.
-			console.debug("pi-sop: resources_discover without cwd; project SOPs not loaded");
-		}
-		const paths = cwd ? existingProjectDirs(dir, cwd) : [];
-
-		const sopPath = join(dir, "sop");
-		if (existsSync(sopPath)) paths.push(sopPath);
-		// A library without the global dir but with project SOPs is still usable.
-		if (paths.length === 0) return {};
-		return { skillPaths: paths };
-	});
-
-	// ---------------------------------------------------------------- //
-	// 2c. before_agent_start: index mode — collapse the library into    //
-	//     ONE prompt entry so context cost is O(1), not O(SOPs).       //
+	// 2. resources_discover: deliberately registers NOTHING              //
 	// ---------------------------------------------------------------- //
 	//
-	// `skillPaths` above stay registered on purpose: that keeps every SOP
-	// reachable via `/skill:<name>` for a HUMAN, and keeps pi's list authoritative.
-	// What index mode changes is only what the MODEL sees, which is decided here.
+	// SOPs used to be exposed as pi skills (`skillPaths: [<libDir>/sop]`), which
+	// put every SOP's name + description + location into the system prompt on
+	// every request: context cost grew linearly with the library. Hiding
+	// individual entries or collapsing them into a synthetic index entry only
+	// moved the constant around.
 	//
-	// pi hands extensions a mutable `systemPromptOptions.skills` array and renders
-	// the prompt from it AFTER handlers run, so filtering it here is the supported
-	// way to shape the skill list without touching files.
-	pi.on("before_agent_start", async (event, _ctx) => {
-		const config = readConfig();
-		if (config.enabled === false) return;
-		const { dir, probe } = resolveState();
-		if (!isUsable(probe.state)) return;
-
-		const skills = event.systemPromptOptions.skills ?? [];
-		// Only touch skills that came from this library; other packages' skills are
-		// none of our business.
-		const ours = skills.filter((skill) => matchesLibrary(skill.filePath, skill.baseDir, dir));
-		if (ours.length === 0) return;
-
-		const { docs } = scanSopDir(dir);
-		if (resolveSkillMode(config.skillMode, docs.length) === "all") return;
-
-		// Index mode: drop every individually-exposed SOP, keep whatever is not
-		// ours, and add the single synthetic entry. No assertion is needed —
-		// `buildIndexSkill` returns pi's own `Skill` shape (built through pi's
-		// `createSyntheticSourceInfo`), so a drift in pi's type is a compile error.
-		event.systemPromptOptions.skills = [
-			...skills.filter((skill) => !matchesLibrary(skill.filePath, skill.baseDir, dir)),
-			buildIndexSkill(docs, dir),
-		];
-	});
+	// The library is a DIRECTORY, not a skill set. The model reads it the same way
+	// it reads any other directory: `sop_search` (a registered tool, whose cost is
+	// one line of prompt) finds candidates, `read` opens the file. Cost is O(1) in
+	// the number of SOPs.
+	//
+	// The handler stays registered on purpose — pi only re-runs resource discovery
+	// for extensions that participate, and returning `{}` is the explicit "this
+	// extension contributes no skill paths" answer rather than silence.
+	pi.on("resources_discover", async () => ({}));
 
 	// ---------------------------------------------------------------- //
-	// 2b. sop_search: the discovery path for SOPs hidden from the skill  //
-	//     list. Hiding without a finder would make them unreachable.     //
+	// 2b. sop_search: the ONLY way SOPs reach the model                  //
 	// ---------------------------------------------------------------- //
 	//
 	// Why this exists: a SOP marked `disable-model-invocation: true` is removed
@@ -365,11 +314,11 @@ export default function piSop(pi: ExtensionAPI): void {
 		name: "sop_search",
 		label: "Search SOPs",
 		description:
-			"Search the shared SOP library, including SOPs that are hidden from the skill list to save context. Returns name, description, triggers, scope, file path and whether it is hidden. Use this when a task might match a documented procedure but no matching skill is visible.",
-		promptSnippet: "Search the SOP library (covers SOPs hidden from the skill list)",
+			"Search the shared SOP library — a directory of documented procedures (deploys, incident fixes, machine quirks, project conventions). Nothing from this library appears in the skill list; this tool is the only way to find it. Returns name, description, triggers, scope and the file path to read.",
+		promptSnippet: "Search the SOP library (a directory of documented procedures)",
 		promptGuidelines: [
-			"The skill list may omit SOPs that were hidden to save context. If a task looks like something that would have been documented (a deploy, an incident, a project's conventions), call sop_search before improvising.",
-			"sop_search returns paths, not contents: open the file with read to get the actual steps.",
+			"The SOP library holds documented procedures but is NOT exposed as skills, so nothing about it appears in the skill list. Before improvising on a task that looks like it would have been written down (a deploy, an incident, a tunnel/DNS fix, a project's conventions, a tool migration), call sop_search first.",
+			"sop_search returns paths, not contents: open the returned filePath with read to get the actual steps.",
 		],
 		parameters: Type.Object({
 			query: Type.Optional(
@@ -378,14 +327,9 @@ export default function piSop(pi: ExtensionAPI): void {
 						"Keywords to look for in name, description, triggers and body. Omit to list every SOP.",
 				}),
 			),
-			include_hidden: Type.Optional(
-				Type.Boolean({
-					description: "Include SOPs hidden from the skill list. Defaults to true.",
-				}),
-			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			return searchSops(params.query ?? "", params.include_hidden !== false, ctx?.cwd);
+			return searchSops(params.query ?? "", ctx?.cwd);
 		},
 	});
 
@@ -595,38 +539,7 @@ function text(message: string, details: Record<string, unknown> = {}): ToolText 
  *
  * Scoring mirrors the human command so the two never disagree about relevance.
  */
-/**
- * True when a skill in the prompt came from this SOP library.
- *
- * Matched against the path AND the skill's baseDir because index-mode entries
- * point at MANIFEST.md (a file directly in the library root) while ordinary SOP
- * skills point inside `sop/` or `projects/<key>/`. Getting this wrong in either
- * direction is bad: too narrow leaves SOPs polluting the prompt, too broad would
- * strip another package's skills.
- */
-function matchesLibrary(filePath: string, baseDir: string | undefined, libDir: string): boolean {
-	const base = canonical(libDir);
-	const paths = [filePath, baseDir].filter((value): value is string => Boolean(value));
-	return paths.some((value) => {
-		const resolved = canonical(value);
-		return resolved === base || resolved.startsWith(`${base}/`);
-	});
-}
-
-/**
- * Resolve `auto` against the current library size.
- *
- * The threshold exists so a tiny library stays convenient (every SOP visible,
- * no search round-trip) while a growing one stops costing context. `all` and
- * `index` bypass it entirely — the setting is a decision, not a hint.
- */
-function resolveSkillMode(mode: SkillMode, sopCount: number): "all" | "index" {
-	if (mode === "all") return "all";
-	if (mode === "index") return "index";
-	return sopCount > INDEX_MODE_THRESHOLD ? "index" : "all";
-}
-
-async function searchSops(query: string, includeHidden: boolean, cwd?: string): Promise<ToolText> {
+async function searchSops(query: string, cwd?: string): Promise<ToolText> {
 	const config = readConfig();
 	if (config.enabled === false) {
 		return text("pi-sop: SOP 库已禁用（运行 /sop init 重新启用）", { found: 0, reason: "disabled" });
@@ -638,10 +551,8 @@ async function searchSops(query: string, includeHidden: boolean, cwd?: string): 
 
 	const needle = query.trim().toLowerCase();
 	const { docs } = scanSopDir(dir);
-	const visible = docs.filter((doc) => includeHidden || !isModelHidden(doc));
-
 	const scored: { doc: (typeof docs)[number]; score: number }[] = [];
-	for (const doc of visible) {
+	for (const doc of docs) {
 		if (!needle) {
 			scored.push({ doc, score: 0 });
 			continue;
@@ -659,9 +570,9 @@ async function searchSops(query: string, includeHidden: boolean, cwd?: string): 
 	}
 
 	if (scored.length === 0) {
-		return text(`SOP 库中没有匹配「${query}」的条目（共 ${visible.length} 条可检索）`, {
+		return text(`SOP 库中没有匹配「${query}」的条目（共 ${docs.length} 条可检索）`, {
 			found: 0,
-			searched: visible.length,
+			searched: docs.length,
 		});
 	}
 	scored.sort((a, b) => b.score - a.score || a.doc.name.localeCompare(b.doc.name));
@@ -670,10 +581,9 @@ async function searchSops(query: string, includeHidden: boolean, cwd?: string): 
 	// is shared), but flagged, because acting on another repo's conventions is a
 	// real mistake. `inCurrentProject` is null when cwd resolves to no key.
 	const currentKeys = cwd ? resolveProjectKeys(cwd) : [];
-	const lines = [`SOP 检索「${query || "*"}」— ${scored.length}/${visible.length} 条：`, ""];
+	const lines = [`SOP 检索「${query || "*"}」— ${scored.length}/${docs.length} 条：`, ""];
 	for (const { doc } of scored.slice(0, 20)) {
-		const hidden = isModelHidden(doc) ? " [已隐藏]" : "";
-		lines.push(`• ${doc.name}${hidden}  [${scopeLabel(doc.scope)}]`);
+		lines.push(`• ${doc.name}  [${scopeLabel(doc.scope)}]`);
 		lines.push(`  ${doc.description}`);
 		if (doc.triggers) lines.push(`  triggers: ${doc.triggers}`);
 		if (doc.lastVerified) lines.push(`  last_verified: ${doc.lastVerified}`);
@@ -684,13 +594,12 @@ async function searchSops(query: string, includeHidden: boolean, cwd?: string): 
 
 	return text(lines.join("\n"), {
 		found: scored.length,
-		searched: visible.length,
+		searched: docs.length,
 		currentProjectKeys: currentKeys,
 		results: scored.slice(0, 20).map(({ doc }) => ({
 			name: doc.name,
 			scope: doc.scope,
 			path: doc.filePath,
-			hidden: isModelHidden(doc),
 		})),
 	});
 }

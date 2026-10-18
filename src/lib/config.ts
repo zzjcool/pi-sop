@@ -49,11 +49,6 @@ export interface PiSopConfig {
 	repo: string | null;
 	/** Whether sop_save may silently create a local-only library. */
 	autoInit: boolean;
-	/**
-	 * How SOPs reach the model. See `SkillMode` — this is the knob that decouples
-	 * context cost from SOP count.
-	 */
-	skillMode: SkillMode;
 	/** ISO timestamp of the first successful init. */
 	initializedAt: string | null;
 	/** ISO timestamp of the last successful pull. */
@@ -66,27 +61,10 @@ export const DEFAULT_CONFIG: PiSopConfig = {
 	libDir: null,
 	repo: null,
 	autoInit: true,
-	skillMode: "auto",
 	initializedAt: null,
 	lastSyncAt: null,
 };
 
-/**
- * How much of the library is exposed as pi skills.
- *
- * - `all`     every SOP becomes a skill (pre-0.7 behaviour). Context cost is
- *             O(number of SOPs) — it grows with the library.
- * - `index`   NO SOP becomes a skill; instead a single generated "index" skill
- *             lists the categories and tells the model to use `sop_search`.
- *             Context cost is O(1) no matter how many SOPs exist.
- * - `auto`    `index` once the library exceeds `INDEX_MODE_THRESHOLD` SOPs,
- *             `all` below it. Keeps a small library convenient while stopping
- *             the growth from ever becoming a problem.
- */
-export type SkillMode = "all" | "index" | "auto";
-
-/** SOP count above which `auto` switches to index mode. */
-export const INDEX_MODE_THRESHOLD = 12;
 
 export type LibDirSource = "env" | "config" | "default";
 
@@ -130,11 +108,6 @@ function readBool(value: unknown, fallback: boolean): boolean {
 	return typeof value === "boolean" ? value : fallback;
 }
 
-/** Unknown or missing `skillMode` degrades to the default, never throws. */
-function readSkillMode(value: unknown): SkillMode {
-	return value === "all" || value === "index" || value === "auto" ? value : DEFAULT_CONFIG.skillMode;
-}
-
 /**
  * Read the config. Never throws: a missing or corrupt file degrades to the
  * defaults so a broken config can never block a session start.
@@ -160,7 +133,6 @@ export function readConfig(): PiSopConfig {
 		libDir: readString(parsed.libDir) ? resolve(expandHome(readString(parsed.libDir) as string)) : null,
 		repo: readString(parsed.repo),
 		autoInit: readBool(parsed.autoInit, DEFAULT_CONFIG.autoInit),
-		skillMode: readSkillMode(parsed.skillMode),
 		initializedAt: readString(parsed.initializedAt),
 		lastSyncAt: readString(parsed.lastSyncAt),
 	};
