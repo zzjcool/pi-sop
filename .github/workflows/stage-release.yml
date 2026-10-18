@@ -1,0 +1,100 @@
+name: Stage release to npm
+
+# Runs when a release tag is pushed (e.g. `git push origin v0.8.0`).
+#
+# This workflow only STAGES the package (`npm stage publish`). Staging defers
+# the 2FA proof-of-presence to a human:
+#   npm stage list            # find the stage id
+#   npm stage approve <id>
+# Staging is deliberate: a tag push must never publish to the public registry
+# without a person looking at it first.
+on:
+  push:
+    tags:
+      # Glob syntax, not regex: `[0-9]*` is the quantifier here, `[0-9]+` would
+      # match a literal "+" and the workflow would never run. A stray tag like
+      # `v1` or `vfoo` is excluded; a malformed one that slips through (e.g.
+      # `v0.8.0.beta`) is caught by the tag-vs-package.json check below.
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+# Never cancel a run halfway through staging.
+concurrency:
+  group: stage-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Required by `npm stage publish --provenance`: the provenance attestation is
+  # signed with a short-lived OIDC token, not a stored secret.
+  id-token: write
+
+jobs:
+  stage:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit SHA, not a floating tag: this job holds NPM_TOKEN.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # Nothing here pushes, so keep the repo token out of .git/config.
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          # Deliberately no `cache: npm`: a cache restored into a job that holds
+          # the publish token is an avoidable supply-chain surface. Install time
+          # is a few seconds; keep this job's inputs only what it checked out.
+
+      # A tag that disagrees with package.json would stage the wrong version,
+      # and `npm stage publish` does not check the tag. Fail loudly instead.
+      # Also picks the dist-tag: a prerelease staged under `latest` would become
+      # the default version everyone installs.
+      - name: Check tag and pick dist-tag
+        id: release
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          echo "tag=$tag package.json=$pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::Tag v$tag does not match package.json $pkg"
+            exit 1
+          fi
+          if [ "${pkg#*-}" != "$pkg" ]; then
+            echo "dist-tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist-tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - run: npm ci
+
+      # Same gate as local development: typecheck + full test suite.
+      - run: npm run verify
+
+      # The package must actually be installable, not merely tested. A broken
+      # `files` list or a missing runtime file only shows up here.
+      - name: Smoke-test the packed tarball
+        run: |
+          npm pack --pack-destination /tmp
+          mkdir -p /tmp/smoke && cd /tmp/smoke
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund /tmp/pi-sop-*.tgz
+          node -e "
+            const fs = require('fs');
+            const base = '/tmp/smoke/node_modules/pi-sop/';
+            const pkg = require(base + 'package.json');
+            const entries = pkg.pi?.extensions ?? [];
+            if (!entries.length) throw new Error('no pi.extensions');
+            for (const rel of entries) {
+              const target = base + rel.replace(/^\.\//, '');
+              if (!fs.existsSync(target)) {
+                throw new Error('missing extension entry: ' + rel);
+              }
+            }
+            console.log('tarball ok:', pkg.name + '@' + pkg.version);
+          "
+
+      - name: Stage on npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DIST_TAG: ${{ steps.release.outputs['dist-tag'] }}
+        run: npm stage publish --provenance --tag "$DIST_TAG"
