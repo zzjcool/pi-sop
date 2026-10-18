@@ -30,9 +30,9 @@ export interface SopFrontmatter {
 /**
  * Frontmatter keys pi-sop owns. Anything else in the frontmatter is preserved
  * verbatim in `SopDoc.extra` so a `sop_save` round-trip never destroys a key it
- * does not understand — pi's own `disable-model-invocation`, a future pi field,
- * or a human's note. Dropping them silently would be the same class of bug as
- * the YAML quoting loss: the file looks saved, the behaviour is gone.
+ * does not understand — a future pi field, a team convention, or a human's
+ * note. Dropping them silently would be the same class of bug as the YAML
+ * quoting loss: the file looks saved, the behaviour is gone.
  */
 const OWNED_KEYS = new Set(["name", "description", "triggers", "last_verified"]);
 
@@ -51,15 +51,9 @@ export interface SopDoc extends SopFrontmatter {
 	body: string;
 	/**
 	 * Frontmatter keys pi-sop does not own, kept so a rewrite cannot destroy them.
-	 * Values are already unquoted by pi's parser. `disable-model-invocation` from
-	 * pi lives here: dropping it would silently re-expose a hidden SOP.
+	 * Values are already unquoted by pi's parser.
 	 */
 	extra: Record<string, string>;
-}
-
-/** True when the SOP is hidden from pi's skill list (pi's own field). */
-export function isModelHidden(doc: SopDoc): boolean {
-	return doc.extra["disable-model-invocation"] === "true";
 }
 
 export interface ParseIssue {
@@ -272,11 +266,11 @@ function parseScalarsLenient(yaml: string): Map<string, string> {
  * positional (`: ` breaks mid-value, `#` only after a space, `[` only at the
  * start, ...), and getting one case wrong means a silently unloadable SOP.
  *
- * Booleans are the exception and are handled BEFORE the round-trip test. pi's
- * `disable-model-invocation` is compared with `=== true` (pi's
- * `core/skills.js`), so a quoted `"true"` parses back as the string "true" and
- * the skill silently stops being hidden. Emitting the bare token is the only
- * form pi accepts, so those two literals bypass quoting.
+ * Booleans are the exception and are handled BEFORE the round-trip test: a
+ * quoted `"true"` parses back as the *string* "true", which silently changes
+ * the type of any unknown key a SOP carries. Bare tokens keep the value a
+ * boolean for consumers that compare identity (pi's skill loader does exactly
+ * that for its own fields).
  */
 function encodeScalar(value: string): string {
 	// Bare boolean tokens: pi requires the YAML boolean, not a string.
@@ -299,28 +293,31 @@ function encodeScalar(value: string): string {
 }
 
 /**
- * Why pi cannot load this document as a skill, or `null` when it can.
+ * Why this document is not a usable SOP, or `null` when it is.
  *
- * Mirrors pi's loader contract for root `.md` skills: the frontmatter must
- * parse as YAML and carry a non-empty `description`. Anything else means the
- * SOP exists on disk but is invisible to the agent.
+ * The rules are pi's own frontmatter contract (parse as YAML, carry a
+ * non-empty `description`). SOPs are no longer registered as skills, so a
+ * violation no longer hides a skill from the prompt — but it still makes the
+ * file unsearchable in a meaningful way: `sop_search` ranks on the description
+ * and `sop_save` refuses to write one without it, so a broken file is a file
+ * the agent will never find. That is worth reporting either way.
  */
 export function frontmatterIssue(content: string): string | null {
 	const { yaml } = splitFrontmatter(content);
-	if (yaml === null) return "缺少 frontmatter（不会被 pi 识别为 skill）";
+	if (yaml === null) return "缺少 frontmatter（不会被 sop_search 收录）";
 	let frontmatter: Record<string, unknown>;
 	try {
 		({ frontmatter } = parseFrontmatter(content));
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		return `frontmatter 不是合法 YAML，pi 会静默跳过这条 skill：${message.split("\n")[0]}`;
+		return `frontmatter 不是合法 YAML，sop_search 会静默跳过这条 SOP：${message.split("\n")[0]}`;
 	}
 	if (!frontmatter || Object.keys(frontmatter).length === 0) {
-		return "frontmatter 为空（不会被 pi 识别为 skill）";
+		return "frontmatter 为空（不会被 sop_search 收录）";
 	}
 	const description = frontmatter.description;
 	if (typeof description !== "string" || description.trim() === "") {
-		return "缺少 description（不会被 pi 识别为 skill）";
+		return "缺少 description（不会被 sop_search 收录，也无法被检索到）";
 	}
 	return null;
 }

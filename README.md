@@ -23,9 +23,17 @@ The extension provides four things:
 | Capability | Mechanism |
 |---|---|
 | **Auto sync** | `session_start` runs `git pull --rebase` (best-effort, offline-safe); on a new machine it can clone the configured repo in the background |
-| **SOP → skills** | `resources_discover` registers `sop/` as a skill path; agents load SOPs by task relevance, no reminder needed |
+| **Lookup** | `sop_search` tool: searches the library (name, triggers, description, body) and returns paths; the agent then reads the file. Nothing from the library is registered as a skill, so prompt cost does not grow with the library |
 | **Write back** | `sop_save` tool: agent writes an SOP, updates MANIFEST, commits & pushes |
-| **Lookup** | `/sop <keyword>` command: grep the library for humans |
+| **Human lookup** | `/sop <keyword>` command: same search, rendered for a human |
+
+### Why SOPs are not skills
+
+Registering `sop/` as a skill path put every SOP's name, description and
+location into the system prompt on every request — cost grew linearly with the
+library. Instead the library is just a directory: `sop_search` finds candidates
+and `read` opens the file. One tool description is the entire prompt cost, no
+matter how many SOPs you accumulate.
 
 ## SOP format
 
@@ -52,7 +60,7 @@ pi install npm:pi-sop
 pi install git:github.com/zzjcool/pi-sop
 ```
 
-Create or clone your SOP library on the first machine (or use `/sop init`). Its git remote is saved as the machine-independent `repo` setting. On other machines, if the configured `libDir` does not exist, pi-sop falls back to `~/sop-library` and automatically clones `repo` there in the background; the current session is never blocked and the new skills take effect on the next session.
+Create or clone your SOP library on the first machine (or use `/sop init`). Its git remote is saved as the machine-independent `repo` setting. On other machines, if the configured `libDir` does not exist, pi-sop falls back to `~/sop-library` and automatically clones `repo` there in the background; the current session is never blocked and the new library is usable on the next session.
 
 ```bash
 git clone git@github.com:<you>/sop-library.git ~/sop-library
@@ -75,7 +83,7 @@ git clone git@github.com:<you>/sop-library.git ~/sop-library
 ## Status
 
 - [x] Project scaffold
-- [x] Core extension (sync / skills / sop_save / /sop)
+- [x] Core extension (sync / sop_search / sop_save / /sop)
 - [x] Multi-machine field test (rebase/conflict/autoInit flows verified end-to-end)
 - [x] npm publish
 

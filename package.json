@@ -1,7 +1,7 @@
 {
   "name": "pi-sop",
   "version": "0.8.0",
-  "description": "SOP library for pi coding agents — git-synced, machine-shared, agent-discoverable. Cross-machine SOP/knowledge base that turns agent workflows into reusable, auto-loaded skills.",
+  "description": "SOP library for pi coding agents — git-synced, machine-shared, agent-discoverable. Turns agent workflows into a searchable procedure library with zero prompt overhead.",
   "license": "MIT",
   "type": "module",
   "keywords": [
@@ -36,7 +36,8 @@
   "files": [
     "src",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "dependencies": {},
   "peerDependencies": {

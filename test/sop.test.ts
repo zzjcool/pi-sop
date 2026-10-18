@@ -17,7 +17,6 @@ import {
 	findNameConflicts,
 	findSopConflicts,
 	frontmatterIssue,
-	isModelHidden,
 	GLOBAL_SCOPE,
 	isValidSopName,
 	listSopFiles,
@@ -654,7 +653,6 @@ test("parseSop round-trip preserves frontmatter keys pi-sop does not own", () =>
 		const read = readSopFile(path);
 		if (!("doc" in read)) throw new Error("expected a doc");
 		assert.equal(read.doc.extra["disable-model-invocation"], "true");
-		assert.equal(isModelHidden(read.doc), true);
 
 		// Rewriting must carry the key through.
 		const rendered = renderSop({ ...read.doc, body: read.doc.body });
