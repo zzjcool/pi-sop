@@ -27,6 +27,15 @@ export interface SopFrontmatter {
 	lastVerified: string;
 }
 
+/**
+ * Frontmatter keys pi-sop owns. Anything else in the frontmatter is preserved
+ * verbatim in `SopDoc.extra` so a `sop_save` round-trip never destroys a key it
+ * does not understand — pi's own `disable-model-invocation`, a future pi field,
+ * or a human's note. Dropping them silently would be the same class of bug as
+ * the YAML quoting loss: the file looks saved, the behaviour is gone.
+ */
+const OWNED_KEYS = new Set(["name", "description", "triggers", "last_verified"]);
+
 export interface SopDoc extends SopFrontmatter {
 	/** Absolute path of the .md file. */
 	filePath: string;
@@ -40,6 +49,17 @@ export interface SopDoc extends SopFrontmatter {
 	 */
 	scope: string;
 	body: string;
+	/**
+	 * Frontmatter keys pi-sop does not own, kept so a rewrite cannot destroy them.
+	 * Values are already unquoted by pi's parser. `disable-model-invocation` from
+	 * pi lives here: dropping it would silently re-expose a hidden SOP.
+	 */
+	extra: Record<string, string>;
+}
+
+/** True when the SOP is hidden from pi's skill list (pi's own field). */
+export function isModelHidden(doc: SopDoc): boolean {
+	return doc.extra["disable-model-invocation"] === "true";
 }
 
 export interface ParseIssue {
@@ -252,14 +272,23 @@ function parseScalarsLenient(yaml: string): Map<string, string> {
  * positional (`: ` breaks mid-value, `#` only after a space, `[` only at the
  * start, ...), and getting one case wrong means a silently unloadable SOP.
  *
- * `lineWidth`-style wrapping is avoided by construction: the JSON fallback is
- * a single physical line, and a plain value that parses back unchanged cannot
- * have been wrapped (wrapping inserts a line break into the value).
+ * Booleans are the exception and are handled BEFORE the round-trip test. pi's
+ * `disable-model-invocation` is compared with `=== true` (pi's
+ * `core/skills.js`), so a quoted `"true"` parses back as the string "true" and
+ * the skill silently stops being hidden. Emitting the bare token is the only
+ * form pi accepts, so those two literals bypass quoting.
  */
 function encodeScalar(value: string): string {
+	// Bare boolean tokens: pi requires the YAML boolean, not a string.
+	if (value === "true" || value === "false") {
+		return value;
+	}
 	const trial = `---\nkey: ${value}\n---\n`;
 	try {
 		const { frontmatter } = parseFrontmatter(trial);
+		// `=== value` compares against the raw text, so a plain numeric/boolean
+		// token that pi coerces (e.g. `123` -> 123) falls through to quoting —
+		// which is what we want for a *string* value.
 		if (frontmatter.key === value) return value;
 	} catch {
 		// fall through to the quoted form
@@ -330,15 +359,24 @@ export function renderSop(doc: {
 	triggers: string;
 	lastVerified: string;
 	body: string;
+	/** Unknown frontmatter keys to re-emit after the owned ones. */
+	extra?: Record<string, string>;
 }): string {
 	const body = doc.body.trim();
-	const frontmatter = [
+	const lines = [
 		`name: ${encodeScalar(doc.name)}`,
 		`description: ${encodeScalar(doc.description)}`,
 		`triggers: ${encodeScalar(doc.triggers)}`,
 		`last_verified: ${encodeScalar(doc.lastVerified)}`,
-	].join("\n");
-	return ["---", frontmatter, "---", "", body, ""].join("\n");
+	];
+	// Unknown keys last, so the owned four keep a stable position (diffs and
+	// human readers both benefit). A key pi-sop happens to own is skipped
+	// rather than duplicated — `extra` is by definition the non-owned set.
+	for (const [key, value] of Object.entries(doc.extra ?? {})) {
+		if (OWNED_KEYS.has(key)) continue;
+		lines.push(`${key}: ${encodeScalar(value)}`);
+	}
+	return ["---", lines.join("\n"), "---", "", body, ""].join("\n");
 }
 
 /**
@@ -370,8 +408,27 @@ export function readSopFile(filePath: string, scope: string = GLOBAL_SCOPE): { d
 			slug,
 			scope,
 			body: splitFrontmatter(content).body,
+			extra: parseExtraKeys(content),
 		},
 	};
+}
+
+/**
+ * Frontmatter keys that pi-sop does not own, as unquoted strings.
+ *
+ * Read through a second pass of the raw frontmatter rather than pi's object,
+ * because pi's parser yields booleans/numbers for unquoted scalars and the
+ * rewrite path needs the value in a form `encodeScalar` can re-emit faithfully.
+ */
+function parseExtraKeys(content: string): Record<string, string> {
+	const { yaml } = splitFrontmatter(content);
+	const extra: Record<string, string> = {};
+	if (!yaml) return extra;
+	for (const [key, value] of parseScalars(yaml)) {
+		if (OWNED_KEYS.has(key)) continue;
+		extra[key] = value;
+	}
+	return extra;
 }
 
 /**

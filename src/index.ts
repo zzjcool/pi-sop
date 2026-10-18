@@ -46,8 +46,10 @@ import {
 	findNameConflicts,
 	findSopConflicts,
 	GLOBAL_SCOPE,
+	isModelHidden,
 	countSops,
 	mostRecentVerification,
+	readSopFile,
 	renderManifest,
 	renderSop,
 	scanSopDir,
@@ -310,6 +312,44 @@ export default function piSop(pi: ExtensionAPI): void {
 	});
 
 	// ---------------------------------------------------------------- //
+	// 2b. sop_search: the discovery path for SOPs hidden from the skill  //
+	//     list. Hiding without a finder would make them unreachable.     //
+	// ---------------------------------------------------------------- //
+	//
+	// Why this exists: a SOP marked `disable-model-invocation: true` is removed
+	// from the system prompt entirely, and pi's `/skill:name` expansion is only
+	// reachable from USER input (`AgentSession._expandSkillCommand` is called
+	// from `_queueUserInput`), so the model cannot invoke it. Without a tool the
+	// hiding would be a one-way door. `sop_search` + `read` is that door.
+	pi.registerTool({
+		name: "sop_search",
+		label: "Search SOPs",
+		description:
+			"Search the shared SOP library, including SOPs that are hidden from the skill list to save context. Returns name, description, triggers, scope, file path and whether it is hidden. Use this when a task might match a documented procedure but no matching skill is visible.",
+		promptSnippet: "Search the SOP library (covers SOPs hidden from the skill list)",
+		promptGuidelines: [
+			"The skill list may omit SOPs that were hidden to save context. If a task looks like something that would have been documented (a deploy, an incident, a project's conventions), call sop_search before improvising.",
+			"sop_search returns paths, not contents: open the file with read to get the actual steps.",
+		],
+		parameters: Type.Object({
+			query: Type.Optional(
+				Type.String({
+					description:
+						"Keywords to look for in name, description, triggers and body. Omit to list every SOP.",
+				}),
+			),
+			include_hidden: Type.Optional(
+				Type.Boolean({
+					description: "Include SOPs hidden from the skill list. Defaults to true.",
+				}),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return searchSops(params.query ?? "", params.include_hidden !== false, ctx?.cwd);
+		},
+	});
+
+	// ---------------------------------------------------------------- //
 	// 3. sop_save: agent writeback with an autoInit fallback             //
 	// ---------------------------------------------------------------- //
 	pi.registerTool({
@@ -505,6 +545,85 @@ function text(message: string, details: Record<string, unknown> = {}): ToolText 
 	return { content: [{ type: "text", text: message }], details };
 }
 
+/**
+ * `sop_search`: the model-facing finder for the whole library.
+ *
+ * Deliberately separate from the `/sop <keyword>` command (which is for a human
+ * reading a notify panel): this returns machine-usable rows with scope and a
+ * stable path, and it defaults to INCLUDING hidden SOPs — the hidden ones are
+ * exactly the ones the model cannot otherwise discover.
+ *
+ * Scoring mirrors the human command so the two never disagree about relevance.
+ */
+async function searchSops(query: string, includeHidden: boolean, cwd?: string): Promise<ToolText> {
+	const config = readConfig();
+	if (config.enabled === false) {
+		return text("pi-sop: SOP 库已禁用（运行 /sop init 重新启用）", { found: 0, reason: "disabled" });
+	}
+	const { dir, probe } = resolveState();
+	if (!isUsable(probe.state)) {
+		return text(`pi-sop: SOP 库不可用（${describeState(probe)}）`, { found: 0, reason: "unusable" });
+	}
+
+	const needle = query.trim().toLowerCase();
+	const { docs } = scanSopDir(dir);
+	const visible = docs.filter((doc) => includeHidden || !isModelHidden(doc));
+
+	const scored: { doc: (typeof docs)[number]; score: number }[] = [];
+	for (const doc of visible) {
+		if (!needle) {
+			scored.push({ doc, score: 0 });
+			continue;
+		}
+		const name = doc.name.toLowerCase();
+		const triggers = doc.triggers.toLowerCase();
+		const description = doc.description.toLowerCase();
+		const body = doc.body.toLowerCase();
+		let score = 0;
+		if (name.includes(needle)) score += 8;
+		if (triggers.includes(needle)) score += 4;
+		if (description.includes(needle)) score += 2;
+		if (body.includes(needle)) score += 1;
+		if (score > 0) scored.push({ doc, score });
+	}
+
+	if (scored.length === 0) {
+		return text(`SOP 库中没有匹配「${query}」的条目（共 ${visible.length} 条可检索）`, {
+			found: 0,
+			searched: visible.length,
+		});
+	}
+	scored.sort((a, b) => b.score - a.score || a.doc.name.localeCompare(b.doc.name));
+
+	// Project SOPs that belong to a DIFFERENT project are included (the library
+	// is shared), but flagged, because acting on another repo's conventions is a
+	// real mistake. `inCurrentProject` is null when cwd resolves to no key.
+	const currentKeys = cwd ? resolveProjectKeys(cwd) : [];
+	const lines = [`SOP 检索「${query || "*"}」— ${scored.length}/${visible.length} 条：`, ""];
+	for (const { doc } of scored.slice(0, 20)) {
+		const hidden = isModelHidden(doc) ? " [已隐藏]" : "";
+		lines.push(`• ${doc.name}${hidden}  [${scopeLabel(doc.scope)}]`);
+		lines.push(`  ${doc.description}`);
+		if (doc.triggers) lines.push(`  triggers: ${doc.triggers}`);
+		if (doc.lastVerified) lines.push(`  last_verified: ${doc.lastVerified}`);
+		lines.push(`  ${doc.filePath}`);
+	}
+	if (scored.length > 20) lines.push("", `…另有 ${scored.length - 20} 条，请用更具体的关键词`);
+	lines.push("", "用 read 工具打开 filePath 查看完整步骤。");
+
+	return text(lines.join("\n"), {
+		found: scored.length,
+		searched: visible.length,
+		currentProjectKeys: currentKeys,
+		results: scored.slice(0, 20).map(({ doc }) => ({
+			name: doc.name,
+			scope: doc.scope,
+			path: doc.filePath,
+			hidden: isModelHidden(doc),
+		})),
+	});
+}
+
 async function saveSop(params: SaveParams, cwd?: string): Promise<ToolText> {
 	const config = readConfig();
 	if (config.enabled === false) return text(NOTIFY.disabledSave, { saved: false, reason: "disabled" });
@@ -598,12 +717,18 @@ async function saveSop(params: SaveParams, cwd?: string): Promise<ToolText> {
 
 	const existed = existsSync(sopPath);
 	const lastVerified = (params.last_verified ?? today()).trim() || today();
+	// Preserve frontmatter keys pi-sop does not own (notably pi's
+	// `disable-model-invocation`). An update must not silently un-hide a SOP or
+	// drop a field a future pi version relies on; a brand-new file has none.
+	const previous = existed ? readSopFile(sopPath) : null;
+	const extra = previous && "doc" in previous ? previous.doc.extra : {};
 	const document = renderSop({
 		name: slug,
 		description: params.description.trim(),
 		triggers: (params.triggers ?? "").trim(),
 		lastVerified,
 		body: params.content,
+		extra,
 	});
 
 	// Whole read-modify-write window (SOP file + MANIFEST) runs in the shared

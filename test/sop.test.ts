@@ -17,6 +17,7 @@ import {
 	findNameConflicts,
 	findSopConflicts,
 	frontmatterIssue,
+	isModelHidden,
 	GLOBAL_SCOPE,
 	isValidSopName,
 	listSopFiles,
@@ -346,8 +347,8 @@ test("countSops counts only markdown files", () => {
 
 test("renderManifest emits a five-column table (scope included) sorted by name", () => {
 	const docs = [
-		{ name: "zebra", scope: "global", description: "z", triggers: "t", lastVerified: "2026-01-01", filePath: "/z", slug: "zebra", body: "" },
-		{ name: "alpha", scope: "global", description: "a", triggers: "t", lastVerified: "2026-01-02", filePath: "/a", slug: "alpha", body: "" },
+		{ name: "zebra", scope: "global", description: "z", triggers: "t", lastVerified: "2026-01-01", filePath: "/z", slug: "zebra", body: "", extra: {} },
+		{ name: "alpha", scope: "global", description: "a", triggers: "t", lastVerified: "2026-01-02", filePath: "/a", slug: "alpha", body: "", extra: {} },
 	];
 	const manifest = renderManifest(docs, "2026-09-21T00:00:00.000Z");
 	assert.match(manifest, /\| name \| scope \| description \| triggers \| last_verified \|/);
@@ -371,6 +372,7 @@ test("renderManifest labels the scope of a project SOP with its project key", ()
 			filePath: "/p",
 			slug: "tdmq-deploy",
 			body: "",
+			extra: {},
 		},
 	];
 	const row = renderManifest(docs).split("\n").find((line) => line.startsWith("| tdmq-deploy |"));
@@ -389,6 +391,7 @@ test("renderManifest shows only the English segment of a bilingual description",
 			filePath: "/b",
 			slug: "bilingual",
 			body: "",
+			extra: {},
 		},
 	];
 	const row = renderManifest(docs).split("\n").find((line) => line.startsWith("| bilingual |"));
@@ -410,6 +413,7 @@ test("renderManifest escapes pipes so a cell value cannot break the table", () =
 			filePath: "/p",
 			slug: "piped",
 			body: "",
+			extra: {},
 		},
 	];
 	const manifest = renderManifest(docs);
@@ -445,6 +449,7 @@ test("renderManifest flattens newlines so rows stay single-line", () => {
 			filePath: "/m",
 			slug: "multi",
 			body: "",
+			extra: {},
 		},
 	];
 	const manifest = renderManifest(docs);
@@ -455,7 +460,7 @@ test("renderManifest flattens newlines so rows stay single-line", () => {
 
 test("mostRecentVerification picks the newest date", () => {
 	const make = (name: string, date: string) =>
-		({ name, scope: "global", description: "", triggers: "", lastVerified: date, filePath: `/${name}`, slug: name, body: "" });
+		({ name, scope: "global", description: "", triggers: "", lastVerified: date, filePath: `/${name}`, slug: name, body: "", extra: {} });
 	assert.equal(mostRecentVerification([]), null);
 	assert.equal(mostRecentVerification([make("a", "")]), null);
 	const result = mostRecentVerification([make("old", "2026-01-01"), make("new", "2026-09-01")]);
@@ -622,4 +627,71 @@ test("readOriginUrlFromGitDir follows [include] config via git fallback", async 
 	// even parse the config for `--get`.
 	assert.equal(readOriginUrlFromGitDir(gitDir), "git@example.com:org/repo.git");
 	rmSync(root, { recursive: true, force: true });
+});
+
+// --- Frontmatter preservation (pi's own keys must survive a rewrite) ------
+//
+// `sop_save` rewrites the whole file from parsed fields. Before v0.5.1 that
+// dropped every key pi-sop did not model, including pi's
+// `disable-model-invocation` — so re-saving a hidden SOP silently re-exposed it
+// to the model. Same silent-loss shape as the YAML quoting bug.
+
+test("parseSop round-trip preserves frontmatter keys pi-sop does not own", () => {
+	const source = [
+		"---",
+		"name: hidden-one",
+		"description: hidden from model",
+		"disable-model-invocation: true",
+		"triggers: a",
+		"last_verified: 2026-10-17",
+		"---",
+		"",
+		"body",
+	].join("\n");
+	withSopDir((dir) => {
+		const path = join(dir, "sop", "hidden-one.md");
+		writeFileSync(path, source);
+		const read = readSopFile(path);
+		if (!("doc" in read)) throw new Error("expected a doc");
+		assert.equal(read.doc.extra["disable-model-invocation"], "true");
+		assert.equal(isModelHidden(read.doc), true);
+
+		// Rewriting must carry the key through.
+		const rendered = renderSop({ ...read.doc, body: read.doc.body });
+		assert.match(rendered, /^disable-model-invocation: true$/m);
+		const again = readSopFile(path);
+		assert.ok("doc" in again);
+		const rerendered = renderSop({ ...again.doc, body: read.doc.body });
+		assert.equal(rerendered, rendered, "re-save must be byte-stable");
+	});
+});
+
+test("renderSop keeps owned keys first and unknown keys after", () => {
+	const rendered = renderSop({
+		name: "n",
+		description: "d",
+		triggers: "t",
+		lastVerified: "2026-10-17",
+		body: "b",
+		extra: { "disable-model-invocation": "true", "custom-note": "keep: me" },
+	});
+	const keys = splitFrontmatter(rendered)
+		.yaml!.split("\n")
+		.map((line) => line.slice(0, line.indexOf(":")));
+	assert.deepEqual(keys, ["name", "description", "triggers", "last_verified", "disable-model-invocation", "custom-note"]);
+	// A value with ': ' must still be quoted even in the unknown-key position.
+	assert.match(rendered, /^custom-note: "keep: me"$/m);
+});
+
+test("renderSop never duplicates a key that extra tries to claim", () => {
+	const rendered = renderSop({
+		name: "n",
+		description: "d",
+		triggers: "t",
+		lastVerified: "2026-10-17",
+		body: "b",
+		extra: { name: "sneaky", description: "sneaky" },
+	});
+	assert.equal((rendered.match(/^name:/gm) ?? []).length, 1);
+	assert.equal((rendered.match(/^description:/gm) ?? []).length, 1);
 });

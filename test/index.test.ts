@@ -1425,3 +1425,125 @@ test("/sop status reports the number of project scopes", async () => {
 		assert.match(text, /SOP 数量: 2/, "both the project SOP and the seed are counted");
 	});
 });
+
+// --- sop_search: the discovery path for hidden SOPs -----------------------
+//
+// A SOP with `disable-model-invocation: true` is removed from the system prompt
+// entirely, and pi's `/skill:name` expansion only runs for USER input, so the
+// model cannot reach it on its own. `sop_search` is what keeps hiding from being
+// a one-way door — these tests pin that contract.
+
+async function callTool(
+	api: FakeApi,
+	name: string,
+	params: Record<string, unknown>,
+	ctx: unknown,
+): Promise<ToolResult> {
+	const tool = api.tools[name] as {
+		execute: (id: string, p: Record<string, unknown>, s: unknown, u: unknown, c: unknown) => Promise<ToolResult>;
+	};
+	assert.ok(tool, `${name} must be registered`);
+	return tool.execute("call-1", params, undefined, undefined, ctx);
+}
+
+test("sop_search is registered alongside sop_save", async () => {
+	await withExtension(async ({ api }) => {
+		assert.ok(api.tools.sop_search, "sop_search must be registered");
+	});
+});
+
+test("sop_search includes hidden SOPs by default and marks them", async () => {
+	await withExtension(async ({ api, libDir }) => {
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(libDir, { commit: false });
+		const { renderSop } = await import("../src/lib/sop.ts");
+		writeFileSync(
+			join(libDir, "sop", "hidden-proc.md"),
+			renderSop({
+				name: "hidden-proc",
+				description: "USE FOR a hidden procedure",
+				triggers: "hiddenproc",
+				lastVerified: "2026-10-17",
+				body: "steps",
+				extra: { "disable-model-invocation": "true" },
+			}),
+		);
+		// The library must be re-probed from a usable state.
+		const result = await callTool(api, "sop_search", { query: "hiddenproc" }, createCtx());
+		assert.match(result.content[0]!.text, /hidden-proc/);
+		assert.match(result.content[0]!.text, /\[已隐藏\]/);
+		const rows = result.details.results as { name: string; hidden: boolean }[];
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0]!.hidden, true);
+	});
+});
+
+test("sop_search can exclude hidden SOPs on request", async () => {
+	await withExtension(async ({ api, libDir }) => {
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(libDir, { commit: false });
+		const { renderSop } = await import("../src/lib/sop.ts");
+		writeFileSync(
+			join(libDir, "sop", "hidden-proc.md"),
+			renderSop({
+				name: "hidden-proc",
+				description: "USE FOR a hidden procedure",
+				triggers: "hiddenproc",
+				lastVerified: "2026-10-17",
+				body: "steps",
+				extra: { "disable-model-invocation": "true" },
+			}),
+		);
+		const result = await callTool(api, "sop_search", { query: "hiddenproc", include_hidden: false }, createCtx());
+		assert.equal(result.details.found, 0);
+	});
+});
+
+test("sop_search with no query lists the whole library", async () => {
+	await withExtension(async ({ api, libDir }) => {
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(libDir, { commit: false });
+		const result = await callTool(api, "sop_search", {}, createCtx());
+		// scaffold writes the seed writing-sops SOP
+		assert.ok((result.details.found as number) >= 1);
+		assert.match(result.content[0]!.text, /writing-sops/);
+	});
+});
+
+test("sop_search reports an unusable library instead of throwing", async () => {
+	await withExtension(async ({ api }) => {
+		const result = await callTool(api, "sop_search", { query: "x" }, createCtx());
+		assert.equal(result.details.found, 0);
+		assert.match(result.content[0]!.text, /不可用/);
+	});
+});
+
+test("sop_save preserves disable-model-invocation across an update", async () => {
+	await withExtension(async ({ api, libDir }) => {
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(libDir, { commit: false });
+		const { renderSop } = await import("../src/lib/sop.ts");
+		const path = join(libDir, "sop", "keep-hidden.md");
+		writeFileSync(
+			path,
+			renderSop({
+				name: "keep-hidden",
+				description: "USE FOR original",
+				triggers: "a",
+				lastVerified: "2026-10-17",
+				body: "v1",
+				extra: { "disable-model-invocation": "true" },
+			}),
+		);
+		await callTool(
+			api,
+			"sop_save",
+			{ name: "keep-hidden", description: "USE FOR updated", content: "v2" },
+			createCtx(),
+		);
+		const after = readFileSync(path, "utf8");
+		assert.match(after, /^disable-model-invocation: true$/m, "hidden flag must survive sop_save");
+		assert.match(after, /USE FOR updated/);
+		assert.match(after, /v2/);
+	});
+});
