@@ -1547,3 +1547,132 @@ test("sop_save preserves disable-model-invocation across an update", async () =>
 		assert.match(after, /v2/);
 	});
 });
+
+// --- Index mode: context cost must be O(1), not O(SOPs) -------------------
+//
+// pi has no grouping or truncation for skills, so registering a growing
+// library as a skill path makes prompt cost grow with the SOP count. Index mode
+// replaces every per-SOP entry with ONE synthetic entry that points at
+// sop_search. These tests pin the two properties that matter: the prompt stays
+// constant as the library grows, and no SOP becomes unreachable.
+
+/** Build a `before_agent_start` event carrying the given skills. */
+function agentStartEvent(skills: { name: string; description: string; filePath: string; baseDir: string }[]) {
+	return {
+		type: "before_agent_start",
+		messageType: "user",
+		prompt: "hi",
+		systemPromptOptions: {
+			skills: skills.map((skill) => ({
+				...skill,
+				sourceInfo: { path: skill.filePath, source: "local", scope: "user", origin: "top-level" },
+				disableModelInvocation: false,
+			})),
+		},
+	};
+}
+
+function writeSop(libDir: string, dirName: string, name: string, description: string): void {
+	const { renderSop } = { renderSop: (d: Record<string, string>) => {
+		const lines = ["---", `name: ${d.name}`, `description: ${d.description}`, "triggers: t", "last_verified: 2026-10-17", "---", "", "body"];
+		return lines.join("\n");
+	} };
+	writeFileSync(join(libDir, dirName, `${name}.md`), renderSop({ name, description, triggers: "t", lastVerified: "2026-10-17", body: "body" }));
+}
+
+test("index mode replaces every SOP skill with one entry", async () => {
+	await withExtension(async ({ api, libDir }) => {
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(libDir, { commit: false });
+		writeConfig({ skillMode: "index" });
+		for (let i = 0; i < 5; i += 1) writeSop(libDir, "sop", `extra-${i}`, `USE FOR thing ${i}`);
+
+		const handler = handlerFor(api, "before_agent_start");
+		const event = agentStartEvent([
+			{ name: "writing-sops", description: "seed", filePath: join(libDir, "sop", "writing-sops.md"), baseDir: join(libDir, "sop") },
+			{ name: "extra-0", description: "x", filePath: join(libDir, "sop", "extra-0.md"), baseDir: join(libDir, "sop") },
+		]);
+		await handler(event, createCtx());
+
+		const names = (event.systemPromptOptions.skills as { name: string }[]).map((s) => s.name);
+		assert.deepEqual(names, ["sop-library"], "only the index entry survives");
+	});
+});
+
+test("index mode never strips skills from other packages", async () => {
+	await withExtension(async ({ api, libDir }) => {
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(libDir, { commit: false });
+		writeConfig({ skillMode: "index" });
+		const handler = handlerFor(api, "before_agent_start");
+		const event = agentStartEvent([
+			{ name: "writing-sops", description: "seed", filePath: join(libDir, "sop", "writing-sops.md"), baseDir: join(libDir, "sop") },
+			{ name: "some-other-package-skill", description: "theirs", filePath: "/elsewhere/pkg/SKILL.md", baseDir: "/elsewhere/pkg" },
+		]);
+		await handler(event, createCtx());
+		const names = (event.systemPromptOptions.skills as { name: string }[]).map((s) => s.name);
+		assert.ok(names.includes("some-other-package-skill"), "foreign skills must be untouched");
+		assert.ok(names.includes("sop-library"));
+		assert.ok(!names.includes("writing-sops"));
+	});
+});
+
+test("index mode description states the count and tells the model to search", async () => {
+	await withExtension(async ({ api, libDir }) => {
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(libDir, { commit: false });
+		writeConfig({ skillMode: "index" });
+		const handler = handlerFor(api, "before_agent_start");
+		const event = agentStartEvent([
+			{ name: "writing-sops", description: "seed", filePath: join(libDir, "sop", "writing-sops.md"), baseDir: join(libDir, "sop") },
+		]);
+		await handler(event, createCtx());
+		const index = (event.systemPromptOptions.skills as { name: string; description: string }[]).find(
+			(s) => s.name === "sop-library",
+		);
+		assert.ok(index);
+		// The search instruction is load-bearing: without it the model invents a
+		// plan instead of looking (verified against the deployed extension).
+		assert.match(index.description, /sop_search/);
+		assert.match(index.description, /条/);
+	});
+});
+
+test("prompt size stays flat while the library grows (the whole point)", async () => {
+	await withExtension(async ({ api, libDir }) => {
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(libDir, { commit: false });
+		writeConfig({ skillMode: "index" });
+		const handler = handlerFor(api, "before_agent_start");
+		const ctx = createCtx();
+
+		const sizeWith = async (count: number) => {
+			for (let i = 0; i < count; i += 1) writeSop(libDir, "sop", `grow-${i}`, `USE FOR growing thing number ${i} with some prose`);
+			const event = agentStartEvent([]);
+			await handler(event, ctx);
+			const skills = event.systemPromptOptions.skills as { name: string; description: string }[];
+			return skills.reduce((sum, s) => sum + s.name.length + s.description.length, 0);
+		};
+
+		const small = await sizeWith(2);
+		const large = await sizeWith(20);
+		// Only the index entry is present, so growth must not scale with count.
+		// The count number itself changes ("4 条" -> "22 条"), hence a tight cap.
+		assert.ok(large - small < 50, `prompt grew by ${large - small} chars for 18 more SOPs`);
+	});
+});
+
+test("skillMode=all keeps every SOP visible (opt-out stays available)", async () => {
+	await withExtension(async ({ api, libDir }) => {
+		const { scaffoldLibrary } = await import("../src/lib/scaffold.ts");
+		await scaffoldLibrary(libDir, { commit: false });
+		writeConfig({ skillMode: "all" });
+		const handler = handlerFor(api, "before_agent_start");
+		const event = agentStartEvent([
+			{ name: "writing-sops", description: "seed", filePath: join(libDir, "sop", "writing-sops.md"), baseDir: join(libDir, "sop") },
+		]);
+		await handler(event, createCtx());
+		const names = (event.systemPromptOptions.skills as { name: string }[]).map((s) => s.name);
+		assert.deepEqual(names, ["writing-sops"], "no index entry in all mode");
+	});
+});

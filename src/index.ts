@@ -28,7 +28,9 @@ import {
 	readConfig,
 	resolveLibDir,
 	writeConfig,
+	INDEX_MODE_THRESHOLD,
 	type ResolvedLibDir,
+	type SkillMode,
 } from "./lib/config.ts";
 import {
 	describeState,
@@ -55,6 +57,7 @@ import {
 	scanSopDir,
 	slugifySopName,
 } from "./lib/sop.ts";
+import { buildIndexSkill } from "./lib/index-skill.ts";
 import {
 	existingProjectDirs,
 	projectDir,
@@ -312,6 +315,43 @@ export default function piSop(pi: ExtensionAPI): void {
 	});
 
 	// ---------------------------------------------------------------- //
+	// 2c. before_agent_start: index mode — collapse the library into    //
+	//     ONE prompt entry so context cost is O(1), not O(SOPs).       //
+	// ---------------------------------------------------------------- //
+	//
+	// `skillPaths` above stay registered on purpose: that keeps every SOP
+	// reachable via `/skill:<name>` for a HUMAN, and keeps pi's list authoritative.
+	// What index mode changes is only what the MODEL sees, which is decided here.
+	//
+	// pi hands extensions a mutable `systemPromptOptions.skills` array and renders
+	// the prompt from it AFTER handlers run, so filtering it here is the supported
+	// way to shape the skill list without touching files.
+	pi.on("before_agent_start", async (event, _ctx) => {
+		const config = readConfig();
+		if (config.enabled === false) return;
+		const { dir, probe } = resolveState();
+		if (!isUsable(probe.state)) return;
+
+		const skills = event.systemPromptOptions.skills ?? [];
+		// Only touch skills that came from this library; other packages' skills are
+		// none of our business.
+		const ours = skills.filter((skill) => matchesLibrary(skill.filePath, skill.baseDir, dir));
+		if (ours.length === 0) return;
+
+		const { docs } = scanSopDir(dir);
+		if (resolveSkillMode(config.skillMode, docs.length) === "all") return;
+
+		// Index mode: drop every individually-exposed SOP, keep whatever is not
+		// ours, and add the single synthetic entry. No assertion is needed —
+		// `buildIndexSkill` returns pi's own `Skill` shape (built through pi's
+		// `createSyntheticSourceInfo`), so a drift in pi's type is a compile error.
+		event.systemPromptOptions.skills = [
+			...skills.filter((skill) => !matchesLibrary(skill.filePath, skill.baseDir, dir)),
+			buildIndexSkill(docs, dir),
+		];
+	});
+
+	// ---------------------------------------------------------------- //
 	// 2b. sop_search: the discovery path for SOPs hidden from the skill  //
 	//     list. Hiding without a finder would make them unreachable.     //
 	// ---------------------------------------------------------------- //
@@ -555,6 +595,37 @@ function text(message: string, details: Record<string, unknown> = {}): ToolText 
  *
  * Scoring mirrors the human command so the two never disagree about relevance.
  */
+/**
+ * True when a skill in the prompt came from this SOP library.
+ *
+ * Matched against the path AND the skill's baseDir because index-mode entries
+ * point at MANIFEST.md (a file directly in the library root) while ordinary SOP
+ * skills point inside `sop/` or `projects/<key>/`. Getting this wrong in either
+ * direction is bad: too narrow leaves SOPs polluting the prompt, too broad would
+ * strip another package's skills.
+ */
+function matchesLibrary(filePath: string, baseDir: string | undefined, libDir: string): boolean {
+	const base = canonical(libDir);
+	const paths = [filePath, baseDir].filter((value): value is string => Boolean(value));
+	return paths.some((value) => {
+		const resolved = canonical(value);
+		return resolved === base || resolved.startsWith(`${base}/`);
+	});
+}
+
+/**
+ * Resolve `auto` against the current library size.
+ *
+ * The threshold exists so a tiny library stays convenient (every SOP visible,
+ * no search round-trip) while a growing one stops costing context. `all` and
+ * `index` bypass it entirely — the setting is a decision, not a hint.
+ */
+function resolveSkillMode(mode: SkillMode, sopCount: number): "all" | "index" {
+	if (mode === "all") return "all";
+	if (mode === "index") return "index";
+	return sopCount > INDEX_MODE_THRESHOLD ? "index" : "all";
+}
+
 async function searchSops(query: string, includeHidden: boolean, cwd?: string): Promise<ToolText> {
 	const config = readConfig();
 	if (config.enabled === false) {
