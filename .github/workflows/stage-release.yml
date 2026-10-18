@@ -67,6 +67,17 @@ jobs:
 
       - run: npm ci
 
+      # `npm stage` is an npm 11 command; the npm bundled with Node 22 is npm 10
+      # and answers "Unknown command: stage". Pinned to an exact version (not a
+      # range) so the step that actually matters cannot drift with a new npm
+      # release; 11.19.0 is the version this was verified against.
+      - name: Use npm with `stage` support
+        run: |
+          npm install -g npm@11.19.0
+          npm --version
+          npm stage --help >/dev/null
+          echo "npm stage is available"
+
       # Same gate as local development: typecheck + full test suite.
       - run: npm run verify
 
