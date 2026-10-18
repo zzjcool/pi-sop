@@ -779,3 +779,116 @@ test("run() timeout kills a hanging child and reports timedOut", async () => {
 	assert.equal(result.timedOut, true, "timeout must be reported as timedOut");
 	rmSync(dir, { recursive: true, force: true });
 });
+
+// --- No configured git identity -------------------------------------------
+//
+// `commit`, `pull --rebase` and `rebase --continue` all CREATE commits, so all
+// three need a user.name/user.email. CI runners and fresh containers have none,
+// and the failure is silent in a specific way: git exits non-zero with
+// "Committer identity unknown", which is neither a conflict nor a network error,
+// so the sync reported "failed" and conflict auto-resolution spun through its
+// 50-step guard and gave up.
+//
+// The gap was invisible locally because a developer machine has a global
+// identity. These tests pin the fix by hiding the global config.
+
+/** Run fn with no global/system git config, i.e. an identity-less machine. */
+async function withoutGlobalGitIdentity(fn: () => Promise<void>): Promise<void> {
+	const previous = {
+		globalCfg: process.env.GIT_CONFIG_GLOBAL,
+		systemCfg: process.env.GIT_CONFIG_SYSTEM,
+		author: process.env.GIT_AUTHOR_NAME,
+		authorEmail: process.env.GIT_AUTHOR_EMAIL,
+		committer: process.env.GIT_COMMITTER_NAME,
+		committerEmail: process.env.GIT_COMMITTER_EMAIL,
+	};
+	process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+	process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+	// Also drop the env-var identity: `rebase --continue` consults config, and
+	// the point is to prove the code supplies its own fallback identity.
+	delete process.env.GIT_AUTHOR_NAME;
+	delete process.env.GIT_AUTHOR_EMAIL;
+	delete process.env.GIT_COMMITTER_NAME;
+	delete process.env.GIT_COMMITTER_EMAIL;
+	try {
+		await fn();
+	} finally {
+		for (const [key, value] of [
+			["GIT_CONFIG_GLOBAL", previous.globalCfg],
+			["GIT_CONFIG_SYSTEM", previous.systemCfg],
+			["GIT_AUTHOR_NAME", previous.author],
+			["GIT_AUTHOR_EMAIL", previous.authorEmail],
+			["GIT_COMMITTER_NAME", previous.committer],
+			["GIT_COMMITTER_EMAIL", previous.committerEmail],
+		] as const) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+}
+
+test("a SOP conflict auto-resolves on a machine with no git identity", async () => {
+	await withoutGlobalGitIdentity(async () => {
+		await withRepo(async ({ dir, root }) => {
+			const remote = join(root, "remote.git");
+			mkdirSync(join(dir, "sop"), { recursive: true });
+			writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d\n---\n\nbody\n");
+			await commitAll(dir, "init");
+			await git(dir, ["push", "--set-upstream", "origin", "main"]);
+
+			const other = join(root, "other");
+			gitSync(root, ["clone", remote, other]);
+			writeFileSync(join(other, "sop", "one.md"), "---\nname: one\ndescription: d-remote\n---\n\nremote\n");
+			writeFileSync(join(other, "MANIFEST.md"), "remote\n");
+			gitSync(other, ["add", "-A"]);
+			gitSync(other, ["commit", "-m", "remote change"]);
+			gitSync(other, ["push", "origin", "main"]);
+
+			writeFileSync(join(dir, "sop", "one.md"), "---\nname: one\ndescription: d-local\n---\n\nlocal\n");
+			writeFileSync(join(dir, "MANIFEST.md"), "local\n");
+			await commitAll(dir, "local change");
+
+			const result = await pullLibrary(dir);
+			assert.equal(result.verdict, "ok", `expected ok, got ${result.verdict} (${result.detail})`);
+			assert.match(readFileSync(join(dir, "sop", "one.md"), "utf8"), /d-local/, "local content wins");
+			assert.equal(existsSync(join(dir, ".git", "rebase-merge")), false, "no stuck rebase");
+		}, { remote: true });
+	});
+});
+
+test("a rename conflict auto-resolves on a machine with no git identity", async () => {
+	// Regression: without an identity the pull itself failed ("Committer identity
+	// unknown"), which looksLikeConflict() does not match, so the sync reported
+	// `failed` and never reached the resolver.
+	await withoutGlobalGitIdentity(async () => {
+		await withRepo(async ({ dir, root }) => {
+			const remote = join(root, "remote.git");
+			mkdirSync(join(dir, "sop"), { recursive: true });
+			writeFileSync(join(dir, "sop", "old-name.md"), "---\nname: old\ndescription: d\n---\n\nbody\n");
+			await commitAll(dir, "init");
+			await git(dir, ["push", "--set-upstream", "origin", "main"]);
+
+			const other = join(root, "other");
+			gitSync(root, ["clone", remote, other]);
+			gitSync(other, ["mv", "sop/old-name.md", "sop/new-name.md"]);
+			gitSync(other, ["commit", "-m", "rename"]);
+			gitSync(other, ["push", "origin", "main"]);
+
+			writeFileSync(join(dir, "sop", "old-name.md"), "---\nname: old\ndescription: d-local\n---\n\nlocal\n");
+			await commitAll(dir, "local edit");
+
+			const result = await pullLibrary(dir);
+			assert.equal(result.verdict, "ok", `expected ok, got ${result.verdict} (${result.detail})`);
+		}, { remote: true });
+	});
+});
+
+test("commitAll supplies a fallback identity instead of failing", async () => {
+	await withoutGlobalGitIdentity(async () => {
+		await withRepo(async ({ dir }) => {
+			writeFileSync(join(dir, "sop-note.md"), "x\n");
+			const result = await commitAll(dir, "init without identity");
+			assert.equal(result.committed, true, `expected a commit, got ${result.reason} (${result.detail})`);
+		});
+	});
+});

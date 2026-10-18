@@ -22,6 +22,21 @@ import { dirname, join } from "node:path";
 import { lockPathForDir, resolveCommonGitDir, resolveGitDir } from "./probe.ts";
 import { rebuildManifest } from "./sop.ts";
 
+/**
+ * Identity flags for git commands that create a commit (`commit`,
+ * `rebase --continue`).
+ *
+ * A machine with no `user.name`/`user.email` configured (a CI runner, a fresh
+ * container) otherwise fails with "Committer identity unknown". `commitAll`
+ * handled that; `rebase --continue` did not, so conflict auto-resolution spun
+ * through its 50-step guard and gave up instead of resolving — the failure only
+ * showed up on machines without a git identity, which is exactly where CI runs.
+ *
+ * Passing these as `-c` (not mutating config) keeps the fallback local to the
+ * command and never writes to the user's repo config.
+ */
+const IDENTITY_ARGS = ["-c", "user.name=pi-sop", "-c", "user.email=pi-sop@localhost"];
+
 /** Timeouts (ms) — design §0: network ops stay in the 5–8s band. */
 export const TIMEOUTS = {
 	lsRemote: 5_000,
@@ -204,7 +219,12 @@ async function unmergedPaths(dir: string): Promise<string[]> {
  * but an empty commit carries none.
  */
 async function rebaseContinue(dir: string): Promise<GitResult> {
-	return git(dir, ["rebase", "--continue"], TIMEOUTS.continue, {
+	// `--continue` CREATES A COMMIT, so it needs an identity exactly like
+	// `git commit` does. Without these flags a machine with no user.name/
+	// user.email (a CI runner, a fresh container) fails every step with
+	// "Committer identity unknown"; the loop then hit its 50-step guard and
+	// reported a bogus "steps exceeded" conflict instead of resolving.
+	return git(dir, [...IDENTITY_ARGS, "rebase", "--continue"], TIMEOUTS.continue, {
 		extraEnv: { GIT_EDITOR: "true" },
 	});
 }
@@ -289,7 +309,7 @@ async function resolveRebase(dir: string): Promise<ConflictResolution> {
 		// Continue failed, rebase still in place, nothing unmerged: skip once.
 		const remaining = await unmergedPaths(dir);
 		if (remaining.length === 0) {
-			const skip = await git(dir, ["rebase", "--skip"], TIMEOUTS.continue);
+			const skip = await git(dir, [...IDENTITY_ARGS, "rebase", "--skip"], TIMEOUTS.continue);
 			steps++;
 			if (!skip.ok && rebaseInProgress(dir)) {
 				return {
@@ -525,7 +545,12 @@ export async function pullLibrary(dir: string): Promise<SyncResult> {
 				message: "库有未提交的修改，已跳过同步（先提交或等待下次保存后重试）",
 			};
 		}
-		const args = ["pull", "--rebase", "--autostash"];
+		// `pull --rebase` replays local commits, which CREATE commits — so it needs
+		// an identity just like `git commit` does. Without it, a machine with no
+		// configured user.name/user.email (CI, a fresh container) fails the pull
+		// with "Committer identity unknown" instead of reaching the conflict
+		// resolver below.
+		const args = [...IDENTITY_ARGS, "pull", "--rebase", "--autostash"];
 		const result = await git(dir, args, TIMEOUTS.pull);
 		if (result.ok) return { verdict: "ok" as SyncVerdict, message: "已同步" };
 		if (looksLikeConflict(result)) {
@@ -644,18 +669,10 @@ export async function commitAll(
 		return { committed: false, reason: "nothing-to-commit" };
 	}
 	let commit = await git(dir, ["commit", "-m", message], TIMEOUTS.local);
-	if (!commit.ok && /Please tell me who you are|empty ident|unable to auto-detect email/i.test(commit.stderr + commit.stdout)) {
+	if (!commit.ok && /Please tell me who you are|empty ident|unable to auto-detect email|Committer identity unknown/i.test(commit.stderr + commit.stdout)) {
 		commit = await git(
 			dir,
-			[
-				"-c",
-				"user.name=pi-sop",
-				"-c",
-				"user.email=pi-sop@localhost",
-				"commit",
-				"-m",
-				message,
-			],
+			[...IDENTITY_ARGS, "commit", "-m", message],
 			TIMEOUTS.local,
 		);
 	}
